@@ -1,0 +1,10 @@
+{
+  "name": "DukaanSaathi Shop OS",
+  "short_name": "DukaanSaathi",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f3ec",
+  "theme_color": "#103939",
+  "description": "Offline-first shop management for Indian retailers",
+  "icons": []
+}

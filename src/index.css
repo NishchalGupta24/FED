@@ -1,0 +1,4 @@
+@import "tailwindcss";
+
+@theme { --color-brand-50: #ecfdf5; --color-brand-600: #047857; --color-brand-700: #065f46; }
+@layer base { body { @apply m-0 min-w-80 bg-slate-50 text-slate-900 antialiased; } button, input, select { font: inherit; } }
