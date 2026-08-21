@@ -1,24 +1,2289 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
-import { BrowserRouter, NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
+import { FormEvent, ReactNode, useEffect, useMemo, useState } from 'react'
+import {
+  BrowserRouter,
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useNavigate,
+} from 'react-router-dom'
 import { QRCodeSVG } from 'qrcode.react'
+
 import { localDb } from './db/localDb'
 import { enqueue } from './sync/outbox'
 import { startSync } from './sync/syncEngine'
 import { api } from './services/api'
 import { sessionStore, type Session } from './services/session'
-import type { Customer, LedgerTransaction, Payment, Product, PurchaseOrder, Sale, SaleItem, StockMovement, Supplier } from '../shared/types'
 
-const id=()=>crypto.randomUUID(), now=()=>new Date().toISOString(), money=(n:number)=>new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(n)
-const Card=({children}:{children:React.ReactNode})=><section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">{children}</section>
-type Ctx={session:Session;products:Product[];customers:Customer[];refresh:()=>Promise<void>}
+import type {
+  Customer,
+  LedgerTransaction,
+  Payment,
+  Product,
+  PurchaseOrder,
+  Sale,
+  SaleItem,
+  StockMovement,
+  Supplier,
+} from '../shared/types'
 
-export default function App(){return <BrowserRouter><Routes><Route path="/login" element={<Login/>}/><Route path="/*" element={<Protected/>}/></Routes></BrowserRouter>}
-function Login(){const nav=useNavigate(),[email,setEmail]=useState('demo@dukaansaathi.in'),[password,setPassword]=useState('Password123'),[error,setError]=useState(''),[busy,setBusy]=useState(false);const demo=()=>{sessionStore.set({token:'offline-demo',shopId:'offline-demo-shop',userId:'offline-demo-owner',role:'OWNER',name:'Demo Owner'});nav('/')};const submit=async(e:FormEvent)=>{e.preventDefault();setBusy(true);setError('');try{sessionStore.set(await api<Session>('/api/auth/login',{method:'POST',body:JSON.stringify({email,password})}));nav('/')}catch(e){setError(e instanceof Error?`${e.message}. You can still use Offline demo.`:'Sign in failed')}finally{setBusy(false)}};return <main className="grid min-h-screen place-items-center bg-emerald-950 p-5"><form onSubmit={submit} className="w-full max-w-sm rounded-3xl bg-white p-7 shadow-2xl"><p className="text-sm font-bold text-emerald-700">DUKAANSAATHI</p><h1 className="mt-2 text-3xl font-bold">Run your shop, anywhere</h1><p className="mt-2 text-sm text-slate-500">Works even when the internet does not.</p><label className="mt-6 block text-sm">Email<input className="mt-1 w-full rounded-xl border p-3" value={email} onChange={e=>setEmail(e.target.value)} type="email" required/></label><label className="mt-4 block text-sm">Password<input className="mt-1 w-full rounded-xl border p-3" value={password} onChange={e=>setPassword(e.target.value)} type="password" required/></label>{error&&<p className="mt-3 text-sm text-amber-700">{error}</p>}<button className="mt-6 w-full rounded-xl bg-emerald-700 p-3 font-semibold text-white" disabled={busy}>{busy?'Signing in…':'Sign in'}</button><button type="button" onClick={demo} className="mt-2 w-full rounded-xl border border-emerald-700 p-3 font-semibold text-emerald-800">Open offline demo</button><p className="mt-4 text-xs text-slate-500">Demo: demo@dukaansaathi.in / Password123</p></form></main>}
-function Protected(){const s=sessionStore.get();return s?<Shop session={s}/>:<Navigate to="/login" replace/>}
-function Shop({session}:{session:Session}){const [products,setProducts]=useState<Product[]>([]),[customers,setCustomers]=useState<Customer[]>([]),[pending,setPending]=useState(0),[online,setOnline]=useState(navigator.onLine);const refresh=async()=>{setProducts(await localDb.products.where('shopId').equals(session.shopId).toArray());setCustomers(await localDb.customers.where('shopId').equals(session.shopId).toArray());setPending(await localDb.outbox.where('syncStatus').anyOf('PENDING','FAILED').count())};useEffect(()=>{void refresh();const on=()=>{setOnline(true);void refresh()},off=()=>setOnline(false);addEventListener('online',on);addEventListener('offline',off);const stop=session.token==='offline-demo'?()=>{}:startSync(session.token,()=>void refresh());return()=>{removeEventListener('online',on);removeEventListener('offline',off);stop()}},[session.shopId,session.token]);const ctx={session,products,customers,refresh};return <div className="min-h-screen bg-slate-50"><header className="flex items-center justify-between border-b bg-white px-4 py-3"><div><b className="text-emerald-800">DukaanSaathi</b><span className="ml-2 text-xs text-slate-500">{session.name}</span></div><span className={`rounded-full px-3 py-1 text-xs ${online?'bg-emerald-100 text-emerald-800':'bg-amber-100 text-amber-800'}`}>{online?'● Online':'● Offline'} · {pending} waiting</span></header><nav className="flex gap-1 overflow-x-auto border-b bg-white px-2 text-sm">{[['/','Dashboard'],['/pos','POS'],['/khata','Khata'],['/inventory','Inventory'],['/suppliers','Suppliers'],['/ocr','OCR']].map(([to,label])=><NavLink end={to==='/'} to={to} key={to} className={({isActive})=>`whitespace-nowrap px-3 py-3 ${isActive?'border-b-2 border-emerald-700 font-bold text-emerald-800':'text-slate-600'}`}>{label}</NavLink>)}<button className="ml-auto px-3 text-slate-500" onClick={()=>{sessionStore.clear();location.assign('/login')}}>Log out</button></nav><main className="mx-auto max-w-6xl p-4"><Routes><Route path="/" element={<Dashboard {...ctx}/>}/><Route path="/inventory" element={<Inventory {...ctx}/>}/><Route path="/khata" element={<Khata {...ctx}/>}/><Route path="/pos" element={<Pos {...ctx}/>}/><Route path="/suppliers" element={<Suppliers {...ctx}/>}/><Route path="/ocr" element={<Ocr {...ctx}/>}/></Routes></main></div>}
-function Dashboard({session,products,customers}:{session:Session;products:Product[];customers:Customer[]}){const [sales,setSales]=useState<Sale[]>([]),[ledger,setLedger]=useState<LedgerTransaction[]>([]);useEffect(()=>{void localDb.sales.where('shopId').equals(session.shopId).toArray().then(setSales);void localDb.ledgerTransactions.where('shopId').equals(session.shopId).toArray().then(setLedger)},[session.shopId,products,customers]);const outstanding=customers.reduce((sum,c)=>sum+ledger.filter(x=>x.customerId===c.customerId).reduce((b,x)=>b+(x.direction==='DEBIT'?x.amount:-x.amount),c.openingBalance),0);const today=new Date().toDateString();return <><h1 className="text-2xl font-bold">Shop dashboard</h1><p className="mt-1 text-sm text-slate-500">Your store is ready for online and offline sales.</p><div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4"><Card><p className="text-sm text-slate-500">Today’s sales</p><b className="text-2xl">{money(sales.filter(s=>new Date(s.createdAt).toDateString()===today).reduce((n,s)=>n+s.total,0))}</b></Card><Card><p className="text-sm text-slate-500">Outstanding khata</p><b className="text-2xl text-amber-700">{money(outstanding)}</b></Card><Card><p className="text-sm text-slate-500">Low stock</p><b className="text-2xl">{products.filter(p=>p.currentStock<=p.minimumStock).length}</b></Card><Card><p className="text-sm text-slate-500">Customers</p><b className="text-2xl">{customers.length}</b></Card></div></>}
-function Inventory({session,products,refresh}:Ctx){const [name,setName]=useState(''),[price,setPrice]=useState(''),[stock,setStock]=useState('');const add=async(e:FormEvent)=>{e.preventDefault();const time=now(),productId=id(),transactionId=id();const p:Product={id:productId,productId,shopId:session.shopId,name,sku:'',unit:'unit',purchasePrice:0,sellingPrice:+price,minimumStock:5,currentStock:+stock,createdAt:time,updatedAt:time};const m:StockMovement={id:id(),shopId:session.shopId,transactionId,productId,quantity:+stock,type:'PURCHASE',direction:'IN',referenceId:productId,createdAt:time,updatedAt:time};await localDb.transaction('rw',localDb.products,localDb.stockMovements,localDb.outbox,async()=>{await localDb.products.put(p);await localDb.stockMovements.put(m);await enqueue({transactionId,entityId:productId,action:'CREATE',endpoint:'/api/products',method:'POST',payload:p})});setName('');setPrice('');setStock('');await refresh()};return <><h1 className="text-2xl font-bold">Inventory</h1><Card><form onSubmit={add} className="grid gap-2 md:grid-cols-4"><input className="rounded-lg border p-2" placeholder="Product name" value={name} onChange={e=>setName(e.target.value)} required/><input className="rounded-lg border p-2" type="number" min="0" placeholder="Selling price" value={price} onChange={e=>setPrice(e.target.value)} required/><input className="rounded-lg border p-2" type="number" min="0" placeholder="Opening stock" value={stock} onChange={e=>setStock(e.target.value)} required/><button className="rounded-lg bg-emerald-700 p-2 font-semibold text-white">Add product</button></form></Card><div className="mt-4 grid gap-3 md:grid-cols-2">{products.map(p=><Card key={p.id}><b>{p.name}</b><p className="text-sm text-slate-500">{money(p.sellingPrice)} · {p.currentStock} in stock</p><span className={p.currentStock<=p.minimumStock?'text-amber-700':'text-emerald-700'}>{p.currentStock<=p.minimumStock?'Low stock':'Healthy'}</span></Card>)}</div></>}
-function Khata({session,customers,refresh}:Ctx){const [name,setName]=useState(''),[phone,setPhone]=useState(''),[selected,setSelected]=useState(''),[amount,setAmount]=useState(''),[ledger,setLedger]=useState<LedgerTransaction[]>([]);useEffect(()=>{void localDb.ledgerTransactions.where('shopId').equals(session.shopId).toArray().then(setLedger)},[session.shopId,customers]);const add=async(e:FormEvent)=>{e.preventDefault();const time=now(),customerId=id(),customer:Customer={id:customerId,customerId,shopId:session.shopId,name,phone,openingBalance:0,interestEnabled:false,createdAt:time,updatedAt:time};await localDb.transaction('rw',localDb.customers,localDb.outbox,async()=>{await localDb.customers.put(customer);await enqueue({transactionId:id(),entityId:customerId,action:'CREATE',endpoint:'/api/customers',method:'POST',payload:customer})});setName('');setPhone('');await refresh()};const pay=async()=>{if(!selected||+amount<=0)return;const time=now(),transactionId=id(),payment:Payment={id:id(),paymentId:id(),shopId:session.shopId,customerId:selected,amount:+amount,status:'SUCCESS',provider:'CASH',transactionId,verifiedAt:time,createdAt:time,updatedAt:time},entry:LedgerTransaction={id:id(),shopId:session.shopId,transactionId:`${transactionId}:ledger`,customerId:selected,type:'PAYMENT',direction:'CREDIT',amount:+amount,referenceId:payment.paymentId,description:'Cash payment',createdAt:time,updatedAt:time};await localDb.transaction('rw',localDb.payments,localDb.ledgerTransactions,localDb.outbox,async()=>{await localDb.payments.put(payment);await localDb.ledgerTransactions.put(entry);await enqueue({transactionId,entityId:payment.paymentId,action:'CREATE',endpoint:'/api/payments',method:'POST',payload:payment})});setAmount('');await refresh();setLedger(await localDb.ledgerTransactions.where('shopId').equals(session.shopId).toArray())};const bal=(c:Customer)=>c.openingBalance+ledger.filter(l=>l.customerId===c.customerId).reduce((n,l)=>n+(l.direction==='DEBIT'?l.amount:-l.amount),0);return <><h1 className="text-2xl font-bold">Khata</h1><Card><form onSubmit={add} className="flex flex-wrap gap-2"><input className="flex-1 rounded-lg border p-2" placeholder="Customer name" value={name} onChange={e=>setName(e.target.value)} required/><input className="flex-1 rounded-lg border p-2" placeholder="Phone" value={phone} onChange={e=>setPhone(e.target.value)} required/><button className="rounded-lg bg-emerald-700 px-4 text-white">Add customer</button></form></Card><div className="mt-4 grid gap-4 md:grid-cols-2"><div className="space-y-2">{customers.map(c=><button className={`block w-full rounded-xl border bg-white p-4 text-left ${selected===c.customerId?'border-emerald-600':''}`} onClick={()=>setSelected(c.customerId)} key={c.id}><b>{c.name}</b><p className="text-sm text-slate-500">{c.phone} · Due {money(bal(c))}</p></button>)}</div><Card><h2 className="font-bold">Record payment</h2><p className="mt-1 text-sm text-slate-500">A payment creates an immutable credit entry.</p><select className="mt-3 w-full rounded-lg border p-2" value={selected} onChange={e=>setSelected(e.target.value)}><option value="">Choose customer</option>{customers.map(c=><option key={c.id} value={c.customerId}>{c.name}</option>)}</select><input className="mt-2 w-full rounded-lg border p-2" type="number" min="1" placeholder="Amount received" value={amount} onChange={e=>setAmount(e.target.value)}/><button onClick={pay} className="mt-2 w-full rounded-lg bg-emerald-700 p-2 text-white">Save cash payment</button>{selected&&<div className="mt-5 space-y-2 text-sm">{ledger.filter(l=>l.customerId===selected).sort((a,b)=>a.createdAt.localeCompare(b.createdAt)).map(l=><div className="flex justify-between" key={l.id}><span>{l.description}</span><b className={l.direction==='DEBIT'?'text-amber-700':'text-emerald-700'}>{l.direction==='DEBIT'?'+':'-'}{money(l.amount)}</b></div>)}</div>}</Card></div></>}
-function Pos({session,products,customers,refresh}:Ctx){const [cart,setCart]=useState<Record<string,number>>({}),[customerId,setCustomerId]=useState(''),[method,setMethod]=useState<'CASH'|'CREDIT'|'UPI'>('CASH'),[showUpi,setShowUpi]=useState(false);const total=useMemo(()=>products.reduce((n,p)=>n+(cart[p.productId]||0)*p.sellingPrice,0),[products,cart]);const transactionId=id(),upi=`upi://pay?pa=saathikirana@upi&pn=Saathi%20Kirana%20Store&am=${total.toFixed(2)}&tn=DukaanSaathi%20sale&tr=${transactionId}`;const checkout=async()=>{const items=products.filter(p=>cart[p.productId]).map(p=>({saleItemId:id(),saleId:'',productId:p.productId,quantity:cart[p.productId],price:p.sellingPrice,purchasePrice:p.purchasePrice}));if(!items.length||items.some(i=>products.find(p=>p.productId===i.productId)!.currentStock<i.quantity))return alert('Add items within available stock');if(method==='CREDIT'&&!customerId)return alert('Choose a customer for credit');const time=now(),saleId=id(),tid=id();items.forEach(i=>i.saleId=saleId);const sale:Sale={id:saleId,saleId,shopId:session.shopId,customerId:method==='CREDIT'?customerId:undefined,items,subtotal:total,discount:0,tax:0,total,paymentMethod:method,paymentStatus:method==='CREDIT'?'PENDING':method==='UPI'?'PENDING':'SUCCESS',transactionId:tid,createdAt:time,updatedAt:time};await localDb.transaction('rw',[localDb.sales,localDb.saleItems,localDb.products,localDb.stockMovements,localDb.ledgerTransactions,localDb.outbox],async()=>{await localDb.sales.put(sale);await localDb.saleItems.bulkPut(items as SaleItem[]);for(const i of items){const p=products.find(v=>v.productId===i.productId)!;await localDb.products.put({...p,currentStock:p.currentStock-i.quantity,updatedAt:time});await localDb.stockMovements.put({id:id(),shopId:session.shopId,transactionId:`${tid}:${i.productId}`,productId:i.productId,quantity:i.quantity,type:'SALE',direction:'OUT',referenceId:saleId,createdAt:time,updatedAt:time})}if(method==='CREDIT')await localDb.ledgerTransactions.put({id:id(),shopId:session.shopId,transactionId:`${tid}:ledger`,customerId,type:'SALE',direction:'DEBIT',amount:total,referenceId:saleId,description:'Credit sale',createdAt:time,updatedAt:time});await enqueue({transactionId:tid,entityId:saleId,action:'CREATE',endpoint:'/api/sales',method:'POST',payload:sale})});setCart({});setCustomerId('');await refresh();alert(`Receipt saved locally: ${money(total)}`)};return <><h1 className="text-2xl font-bold">Point of sale</h1><div className="mt-4 grid gap-4 md:grid-cols-[1fr_340px]"><div className="grid gap-2 sm:grid-cols-2">{products.map(p=><button key={p.id} disabled={!p.currentStock} onClick={()=>setCart(c=>({...c,[p.productId]:(c[p.productId]||0)+1}))} className="rounded-xl border bg-white p-4 text-left disabled:opacity-40"><b>{p.name}</b><p>{money(p.sellingPrice)} · {p.currentStock} left</p></button>)}</div><Card><h2 className="font-bold">Current bill</h2>{Object.entries(cart).map(([pid,q])=>{const p=products.find(v=>v.productId===pid)!;return <div className="mt-2 flex justify-between" key={pid}><span>{p.name} × {q}</span><button onClick={()=>setCart(c=>({...c,[pid]:Math.max(0,(c[pid]||0)-1)}))}>−</button></div>})}<p className="mt-3 text-xl font-bold">{money(total)}</p><select className="mt-3 w-full rounded-lg border p-2" value={method} onChange={e=>setMethod(e.target.value as typeof method)}><option value="CASH">Cash</option><option value="UPI">UPI (demo verification)</option><option value="CREDIT">Credit / Khata</option></select>{method==='CREDIT'&&<select className="mt-2 w-full rounded-lg border p-2" value={customerId} onChange={e=>setCustomerId(e.target.value)}><option value="">Customer</option>{customers.map(c=><option key={c.id} value={c.customerId}>{c.name}</option>)}</select>}{method==='UPI'&&<button onClick={()=>setShowUpi(!showUpi)} className="mt-2 w-full rounded-lg border border-emerald-700 p-2 text-emerald-800">{showUpi?'Hide':'Show'} UPI QR</button>}{showUpi&&<div className="mt-3 grid place-items-center rounded-xl bg-slate-50 p-3"><QRCodeSVG value={upi}/><a className="mt-2 text-sm text-emerald-700" href={upi}>Open UPI app</a><small className="mt-1 text-center text-slate-500">Demo verification only — confirm payment manually.</small></div>}<button onClick={checkout} className="mt-3 w-full rounded-lg bg-emerald-700 p-2 text-white">Save {method.toLowerCase()} sale</button></Card></div></>}
-function Suppliers({session,products,refresh}:Ctx){const [name,setName]=useState(''),[items,setItems]=useState<Supplier[]>([]),[orders,setOrders]=useState<PurchaseOrder[]>([]);useEffect(()=>{void localDb.suppliers.where('shopId').equals(session.shopId).toArray().then(setItems);void localDb.purchaseOrders.where('shopId').equals(session.shopId).toArray().then(setOrders)},[session.shopId]);const add=async(e:FormEvent)=>{e.preventDefault();const time=now(),supplierId=id(),v:Supplier={id:supplierId,supplierId,shopId:session.shopId,name,createdAt:time,updatedAt:time};await localDb.transaction('rw',localDb.suppliers,localDb.outbox,async()=>{await localDb.suppliers.put(v);await enqueue({transactionId:id(),entityId:supplierId,action:'CREATE',endpoint:'/api/suppliers',method:'POST',payload:v})});setItems([...items,v]);setName('')};const order=async(supplierId:string)=>{const low=products.filter(p=>p.currentStock<=p.minimumStock);if(!low.length)return alert('No low-stock products');const time=now(),purchaseOrderId=id(),v:PurchaseOrder={id:purchaseOrderId,purchaseOrderId,shopId:session.shopId,supplierId,items:low.map(p=>({productId:p.productId,quantity:Math.max(1,p.minimumStock*2-p.currentStock),price:p.purchasePrice||p.sellingPrice})),estimatedTotal:low.reduce((n,p)=>n+Math.max(1,p.minimumStock*2-p.currentStock)*(p.purchasePrice||p.sellingPrice),0),status:'DRAFT',transactionId:id(),createdAt:time,updatedAt:time};await localDb.transaction('rw',localDb.purchaseOrders,localDb.outbox,async()=>{await localDb.purchaseOrders.put(v);await enqueue({transactionId:v.transactionId,entityId:purchaseOrderId,action:'CREATE',endpoint:'/api/purchase-orders',method:'POST',payload:v})});setOrders([...orders,v]);await refresh()};return <><h1 className="text-2xl font-bold">Suppliers & purchase orders</h1><Card><form onSubmit={add} className="flex gap-2"><input className="flex-1 rounded-lg border p-2" value={name} onChange={e=>setName(e.target.value)} placeholder="Supplier name" required/><button className="rounded-lg bg-emerald-700 px-4 text-white">Add supplier</button></form></Card><div className="mt-4 grid gap-3 md:grid-cols-2">{items.map(s=><Card key={s.id}><b>{s.name}</b><p className="mt-1 text-sm text-slate-500">{orders.filter(o=>o.supplierId===s.supplierId).length} purchase orders</p><button onClick={()=>void order(s.supplierId)} className="mt-3 rounded-lg border border-emerald-700 px-3 py-2 text-sm text-emerald-800">Create low-stock draft</button></Card>)}</div>{orders.length>0&&<Card><h2 className="font-bold">Purchase drafts</h2>{orders.map(o=><p className="mt-2 text-sm" key={o.id}>{o.status} · {o.items.length} items · {money(o.estimatedTotal)}</p>)}</Card>}</>}
-function Ocr({products}:Ctx){const [file,setFile]=useState<File|null>(null),[text,setText]=useState(''),[busy,setBusy]=useState(false);const run=async()=>{if(!file)return;setBusy(true);try{const { createWorker }=await import('tesseract.js');const worker=await createWorker('eng');const r=await worker.recognize(file);setText(r.data.text);await worker.terminate()}catch{setText('Could not read this image. Please enter the purchase lines manually.')}finally{setBusy(false)}};return <><h1 className="text-2xl font-bold">Invoice OCR</h1><Card><p className="text-slate-600">Upload a supplier invoice. OCR only creates a review draft; stock never changes until you confirm it.</p><input className="mt-4 block w-full text-sm" accept="image/*" type="file" onChange={e=>setFile(e.target.files?.[0]||null)}/><button disabled={!file||busy} onClick={run} className="mt-3 rounded-lg bg-emerald-700 px-4 py-2 text-white">{busy?'Reading bill…':'Extract text'}</button>{text&&<><textarea className="mt-4 min-h-48 w-full rounded-lg border p-3" value={text} onChange={e=>setText(e.target.value)}/><p className="mt-2 text-sm text-amber-700">Review product mappings, quantities and prices before creating a purchase.</p><p className="mt-1 text-xs text-slate-500">{products.length} local products available for matching.</p></>}</Card></>}
+/* =========================================================
+   HELPERS
+========================================================= */
+
+const id = () => crypto.randomUUID()
+
+const now = () => new Date().toISOString()
+
+const money = (n: number) =>
+  new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 0,
+  }).format(n)
+
+/* =========================================================
+   REUSABLE UI
+========================================================= */
+
+const Card = ({
+  children,
+  className = '',
+}: {
+  children: ReactNode
+  className?: string
+}) => (
+  <section
+    className={`rounded-2xl border border-slate-200 bg-white p-5
+      shadow-[0_4px_20px_rgba(15,23,42,0.05)]
+      transition-all duration-200
+      hover:shadow-[0_10px_30px_rgba(15,23,42,0.08)]
+      ${className}`}
+  >
+    {children}
+  </section>
+)
+
+const Input = ({
+  className = '',
+  ...props
+}: React.InputHTMLAttributes<HTMLInputElement>) => (
+  <input
+    {...props}
+    className={`w-full rounded-xl border border-slate-200 bg-white px-4 py-3
+      text-sm text-slate-900 outline-none transition
+      placeholder:text-slate-400
+      focus:border-emerald-600
+      focus:ring-4 focus:ring-emerald-100
+      ${className}`}
+  />
+)
+
+const Select = ({
+  className = '',
+  ...props
+}: React.SelectHTMLAttributes<HTMLSelectElement>) => (
+  <select
+    {...props}
+    className={`w-full rounded-xl border border-slate-200 bg-white px-4 py-3
+      text-sm text-slate-900 outline-none transition
+      focus:border-emerald-600
+      focus:ring-4 focus:ring-emerald-100
+      ${className}`}
+  />
+)
+
+const PrimaryButton = ({
+  children,
+  className = '',
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+  <button
+    {...props}
+    className={`rounded-xl bg-emerald-700 px-5 py-3
+      font-semibold text-white shadow-sm transition
+      hover:bg-emerald-800
+      active:scale-[0.98]
+      disabled:cursor-not-allowed
+      disabled:opacity-50
+      ${className}`}
+  >
+    {children}
+  </button>
+)
+
+const SecondaryButton = ({
+  children,
+  className = '',
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+  <button
+    {...props}
+    className={`rounded-xl border border-emerald-200 bg-white px-5 py-3
+      font-semibold text-emerald-800 transition
+      hover:bg-emerald-50
+      active:scale-[0.98]
+      ${className}`}
+  >
+    {children}
+  </button>
+)
+
+/* =========================================================
+   TYPES
+========================================================= */
+
+type Ctx = {
+  session: Session
+  products: Product[]
+  customers: Customer[]
+  refresh: () => Promise<void>
+}
+
+/* =========================================================
+   APP
+========================================================= */
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/*" element={<Protected />} />
+      </Routes>
+    </BrowserRouter>
+  )
+}
+
+/* =========================================================
+   LOGIN
+========================================================= */
+
+function Login() {
+  const nav = useNavigate()
+
+  const [email, setEmail] = useState('demo@dukaansaathi.in')
+  const [password, setPassword] = useState('Password123')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const demo = () => {
+    sessionStore.set({
+      token: 'offline-demo',
+      shopId: 'offline-demo-shop',
+      userId: 'offline-demo-owner',
+      role: 'OWNER',
+      name: 'Demo Owner',
+    })
+
+    nav('/')
+  }
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault()
+
+    setBusy(true)
+    setError('')
+
+    try {
+      sessionStore.set(
+        await api<Session>('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({
+            email,
+            password,
+          }),
+        }),
+      )
+
+      nav('/')
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? `${e.message}. You can still use Offline demo.`
+          : 'Sign in failed',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="relative grid min-h-screen place-items-center overflow-hidden bg-slate-950 p-5">
+
+      {/* Background decoration */}
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute -left-32 -top-32 h-96 w-96 rounded-full bg-emerald-500/20 blur-3xl" />
+        <div className="absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-teal-400/10 blur-3xl" />
+      </div>
+
+      <form
+        onSubmit={submit}
+        className="relative w-full max-w-md overflow-hidden rounded-3xl border border-white/10 bg-white p-8 shadow-2xl"
+      >
+
+        {/* Brand */}
+        <div className="flex items-center gap-3">
+
+          <div className="grid h-12 w-12 place-items-center rounded-2xl bg-emerald-700 font-bold text-white shadow-lg">
+            DS
+          </div>
+
+          <div>
+            <p className="font-bold tracking-tight text-slate-950">
+              Dukaan<span className="text-emerald-700">Saathi</span>
+            </p>
+
+            <p className="text-xs text-slate-500">
+              Shop Management System
+            </p>
+          </div>
+
+        </div>
+
+        <div className="mt-8">
+          <p className="text-sm font-semibold text-emerald-700">
+            WELCOME BACK
+          </p>
+
+          <h1 className="mt-2 text-4xl font-bold tracking-tight text-slate-950">
+            Run your shop,
+            <br />
+            anywhere.
+          </h1>
+
+          <p className="mt-3 text-sm leading-6 text-slate-500">
+            Manage sales, inventory, customers and suppliers from one simple
+            dashboard.
+          </p>
+        </div>
+
+        <label className="mt-7 block text-sm font-medium text-slate-700">
+          Email
+
+          <Input
+            className="mt-2"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            type="email"
+            required
+          />
+        </label>
+
+        <label className="mt-4 block text-sm font-medium text-slate-700">
+          Password
+
+          <Input
+            className="mt-2"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            type="password"
+            required
+          />
+        </label>
+
+        {error && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+            {error}
+          </div>
+        )}
+
+        <PrimaryButton
+          className="mt-6 w-full"
+          disabled={busy}
+        >
+          {busy ? 'Signing in…' : 'Sign in'}
+        </PrimaryButton>
+
+        <SecondaryButton
+          type="button"
+          onClick={demo}
+          className="mt-3 w-full"
+        >
+          Open offline demo
+        </SecondaryButton>
+
+        <div className="mt-6 rounded-xl bg-slate-50 p-3 text-center text-xs text-slate-500">
+          Demo account
+          <br />
+          <span className="font-medium text-slate-700">
+            demo@dukaansaathi.in / Password123
+          </span>
+        </div>
+
+      </form>
+    </main>
+  )
+}
+
+/* =========================================================
+   PROTECTED
+========================================================= */
+
+function Protected() {
+  const s = sessionStore.get()
+
+  return s ? (
+    <Shop session={s} />
+  ) : (
+    <Navigate to="/login" replace />
+  )
+}
+
+/* =========================================================
+   SHOP SHELL
+========================================================= */
+
+function Shop({ session }: { session: Session }) {
+  const [products, setProducts] = useState<Product[]>([])
+  const [customers, setCustomers] = useState<Customer[]>([])
+  const [pending, setPending] = useState(0)
+  const [online, setOnline] = useState(navigator.onLine)
+
+  const refresh = async () => {
+    setProducts(
+      await localDb.products
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+
+    setCustomers(
+      await localDb.customers
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+
+    setPending(
+      await localDb.outbox
+        .where('syncStatus')
+        .anyOf('PENDING', 'FAILED')
+        .count(),
+    )
+  }
+
+  useEffect(() => {
+    void refresh()
+
+    const on = () => {
+      setOnline(true)
+      void refresh()
+    }
+
+    const off = () => {
+      setOnline(false)
+    }
+
+    addEventListener('online', on)
+    addEventListener('offline', off)
+
+    const stop =
+      session.token === 'offline-demo'
+        ? () => {}
+        : startSync(session.token, () => void refresh())
+
+    return () => {
+      removeEventListener('online', on)
+      removeEventListener('offline', off)
+      stop()
+    }
+  }, [session.shopId, session.token])
+
+  const ctx = {
+    session,
+    products,
+    customers,
+    refresh,
+  }
+
+  const navigation = [
+    ['/', 'Dashboard'],
+    ['/pos', 'POS'],
+    ['/khata', 'Khata'],
+    ['/inventory', 'Inventory'],
+    ['/suppliers', 'Suppliers'],
+    ['/ocr', 'OCR'],
+  ]
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+
+      {/* TOP HEADER */}
+      <header className="sticky top-0 z-40 border-b border-slate-200/80 bg-white/95 backdrop-blur">
+
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6">
+
+          <div className="flex items-center gap-3">
+
+            <div className="grid h-10 w-10 place-items-center rounded-xl bg-emerald-700 font-bold text-white shadow-sm">
+              DS
+            </div>
+
+            <div>
+              <div className="text-base font-bold tracking-tight">
+                Dukaan<span className="text-emerald-700">Saathi</span>
+              </div>
+
+              <div className="text-xs text-slate-500">
+                {session.name}
+              </div>
+            </div>
+
+          </div>
+
+          <div
+            className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
+              online
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-amber-200 bg-amber-50 text-amber-700'
+            }`}
+          >
+            <span className="text-[10px]">
+              ●
+            </span>
+
+            {online ? 'Online' : 'Offline'}
+
+            <span className="opacity-50">·</span>
+
+            {pending} waiting
+          </div>
+
+        </div>
+      </header>
+
+      {/* NAVIGATION */}
+      <nav className="sticky top-[66px] z-30 border-b border-slate-200 bg-white">
+
+        <div className="mx-auto flex max-w-7xl items-center gap-1 overflow-x-auto px-2">
+
+          {navigation.map(([to, label]) => (
+            <NavLink
+              key={to}
+              end={to === '/'}
+              to={to}
+              className={({ isActive }) =>
+                `relative whitespace-nowrap rounded-lg px-4 py-3 text-sm font-medium transition ${
+                  isActive
+                    ? 'bg-emerald-50 text-emerald-800'
+                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950'
+                }`
+              }
+            >
+              {label}
+            </NavLink>
+          ))}
+
+          <button
+            className="ml-auto whitespace-nowrap rounded-lg px-4 py-3 text-sm font-medium text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
+            onClick={() => {
+              sessionStore.clear()
+              location.assign('/login')
+            }}
+          >
+            Log out
+          </button>
+
+        </div>
+      </nav>
+
+      {/* PAGE */}
+      <main className="mx-auto max-w-7xl p-4 sm:p-6">
+        <Routes>
+
+          <Route
+            path="/"
+            element={<Dashboard {...ctx} />}
+          />
+
+          <Route
+            path="/inventory"
+            element={<Inventory {...ctx} />}
+          />
+
+          <Route
+            path="/khata"
+            element={<Khata {...ctx} />}
+          />
+
+          <Route
+            path="/pos"
+            element={<Pos {...ctx} />}
+          />
+
+          <Route
+            path="/suppliers"
+            element={<Suppliers {...ctx} />}
+          />
+
+          <Route
+            path="/ocr"
+            element={<Ocr {...ctx} />}
+          />
+
+        </Routes>
+      </main>
+
+    </div>
+  )
+}
+
+/* =========================================================
+   DASHBOARD
+========================================================= */
+
+function Dashboard({
+  session,
+  products,
+  customers,
+}: {
+  session: Session
+  products: Product[]
+  customers: Customer[]
+}) {
+  const [sales, setSales] = useState<Sale[]>([])
+  const [ledger, setLedger] = useState<LedgerTransaction[]>([])
+
+  useEffect(() => {
+    void localDb.sales
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+      .then(setSales)
+
+    void localDb.ledgerTransactions
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+      .then(setLedger)
+  }, [session.shopId, products, customers])
+
+  const outstanding = customers.reduce(
+    (sum, c) =>
+      sum +
+      ledger
+        .filter((x) => x.customerId === c.customerId)
+        .reduce(
+          (b, x) =>
+            b + (x.direction === 'DEBIT' ? x.amount : -x.amount),
+          c.openingBalance,
+        ),
+    0,
+  )
+
+  const today = new Date().toDateString()
+
+  const todaySales = sales
+    .filter(
+      (s) => new Date(s.createdAt).toDateString() === today,
+    )
+    .reduce((n, s) => n + s.total, 0)
+
+  const lowStock = products.filter(
+    (p) => p.currentStock <= p.minimumStock,
+  )
+
+  return (
+    <div className="space-y-6">
+
+      {/* HERO */}
+      <section className="relative overflow-hidden rounded-3xl bg-slate-950 p-6 text-white shadow-xl sm:p-8">
+
+        <div className="absolute -right-20 -top-20 h-64 w-64 rounded-full bg-emerald-500/20 blur-3xl" />
+
+        <div className="relative flex flex-col justify-between gap-6 md:flex-row md:items-end">
+
+          <div>
+
+            <div className="mb-3 inline-flex rounded-full border border-emerald-400/20 bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-300">
+              SHOP OVERVIEW
+            </div>
+
+            <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
+              Good to see you, {session.name}.
+            </h1>
+
+            <p className="mt-3 max-w-xl text-sm leading-6 text-slate-300">
+              Everything you need to manage your shop — sales, inventory,
+              customers and suppliers in one place.
+            </p>
+
+          </div>
+
+          <NavLink
+            to="/pos"
+            className="inline-flex w-fit items-center rounded-xl bg-emerald-600 px-5 py-3 font-semibold text-white transition hover:bg-emerald-500"
+          >
+            Start a new sale →
+          </NavLink>
+
+        </div>
+
+      </section>
+
+      {/* STATS */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+
+        <Card>
+          <p className="text-sm font-medium text-slate-500">
+            Today's sales
+          </p>
+
+          <div className="mt-3 flex items-end justify-between">
+
+            <b className="text-3xl font-bold tracking-tight text-slate-950">
+              {money(todaySales)}
+            </b>
+
+            <span className="rounded-lg bg-emerald-50 px-2 py-1 text-xs font-bold text-emerald-700">
+              SALES
+            </span>
+
+          </div>
+
+          <p className="mt-2 text-xs text-slate-400">
+            Total recorded today
+          </p>
+        </Card>
+
+        <Card>
+          <p className="text-sm font-medium text-slate-500">
+            Outstanding khata
+          </p>
+
+          <div className="mt-3 flex items-end justify-between">
+
+            <b className="text-3xl font-bold tracking-tight text-amber-700">
+              {money(outstanding)}
+            </b>
+
+            <span className="rounded-lg bg-amber-50 px-2 py-1 text-xs font-bold text-amber-700">
+              DUE
+            </span>
+
+          </div>
+
+          <p className="mt-2 text-xs text-slate-400">
+            Customer credit balance
+          </p>
+        </Card>
+
+        <Card>
+          <p className="text-sm font-medium text-slate-500">
+            Low stock
+          </p>
+
+          <div className="mt-3 flex items-end justify-between">
+
+            <b className="text-3xl font-bold tracking-tight text-slate-950">
+              {lowStock.length}
+            </b>
+
+            <span className="rounded-lg bg-rose-50 px-2 py-1 text-xs font-bold text-rose-700">
+              ACTION
+            </span>
+
+          </div>
+
+          <p className="mt-2 text-xs text-slate-400">
+            Products need attention
+          </p>
+        </Card>
+
+        <Card>
+          <p className="text-sm font-medium text-slate-500">
+            Customers
+          </p>
+
+          <div className="mt-3 flex items-end justify-between">
+
+            <b className="text-3xl font-bold tracking-tight text-slate-950">
+              {customers.length}
+            </b>
+
+            <span className="rounded-lg bg-sky-50 px-2 py-1 text-xs font-bold text-sky-700">
+              KHATA
+            </span>
+
+          </div>
+
+          <p className="mt-2 text-xs text-slate-400">
+            Saved customers
+          </p>
+        </Card>
+
+      </div>
+
+      {/* MAIN DASHBOARD */}
+      <div className="grid gap-5 lg:grid-cols-[1.4fr_0.8fr]">
+
+        <Card>
+
+          <div className="flex items-center justify-between">
+
+            <div>
+              <h2 className="text-lg font-bold text-slate-950">
+                Store overview
+              </h2>
+
+              <p className="mt-1 text-sm text-slate-500">
+                Quick access to the important parts of your store.
+              </p>
+            </div>
+
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+              Today
+            </span>
+
+          </div>
+
+          <div className="mt-5 grid gap-3 sm:grid-cols-3">
+
+            <NavLink
+              to="/inventory"
+              className="rounded-2xl border border-slate-200 p-4 transition hover:-translate-y-0.5 hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <div className="text-xl">📦</div>
+
+              <p className="mt-3 font-semibold">
+                Inventory
+              </p>
+
+              <p className="mt-1 text-xs text-slate-500">
+                {products.length} products
+              </p>
+            </NavLink>
+
+            <NavLink
+              to="/khata"
+              className="rounded-2xl border border-slate-200 p-4 transition hover:-translate-y-0.5 hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <div className="text-xl">📒</div>
+
+              <p className="mt-3 font-semibold">
+                Khata
+              </p>
+
+              <p className="mt-1 text-xs text-slate-500">
+                {customers.length} customers
+              </p>
+            </NavLink>
+
+            <NavLink
+              to="/suppliers"
+              className="rounded-2xl border border-slate-200 p-4 transition hover:-translate-y-0.5 hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <div className="text-xl">🚚</div>
+
+              <p className="mt-3 font-semibold">
+                Suppliers
+              </p>
+
+              <p className="mt-1 text-xs text-slate-500">
+                Manage purchases
+              </p>
+            </NavLink>
+
+          </div>
+
+          {lowStock.length > 0 ? (
+            <div className="mt-5 flex flex-col justify-between gap-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 sm:flex-row sm:items-center">
+
+              <div>
+                <p className="font-semibold text-amber-900">
+                  ⚠ Low stock needs attention
+                </p>
+
+                <p className="mt-1 text-sm text-amber-800">
+                  {lowStock
+                    .slice(0, 3)
+                    .map((p) => p.name)
+                    .join(' · ')}
+
+                  {lowStock.length > 3 ? ' · …' : ''}
+                </p>
+              </div>
+
+              <NavLink
+                to="/inventory"
+                className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-amber-800 shadow-sm"
+              >
+                View inventory
+              </NavLink>
+
+            </div>
+          ) : (
+            <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm font-medium text-emerald-800">
+              ✓ Your current stock levels look healthy.
+            </div>
+          )}
+
+        </Card>
+
+        {/* QUICK ACTIONS */}
+        <Card>
+
+          <h2 className="text-lg font-bold">
+            Quick actions
+          </h2>
+
+          <p className="mt-1 text-sm text-slate-500">
+            Common tasks for running your shop.
+          </p>
+
+          <div className="mt-5 space-y-2">
+
+            <NavLink
+              to="/pos"
+              className="flex items-center justify-between rounded-xl border border-slate-200 p-3 font-semibold transition hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <span>New sale</span>
+              <span className="text-emerald-700">→</span>
+            </NavLink>
+
+            <NavLink
+              to="/inventory"
+              className="flex items-center justify-between rounded-xl border border-slate-200 p-3 font-semibold transition hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <span>Add product</span>
+              <span className="text-emerald-700">→</span>
+            </NavLink>
+
+            <NavLink
+              to="/khata"
+              className="flex items-center justify-between rounded-xl border border-slate-200 p-3 font-semibold transition hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <span>Add customer</span>
+              <span className="text-emerald-700">→</span>
+            </NavLink>
+
+            <NavLink
+              to="/ocr"
+              className="flex items-center justify-between rounded-xl border border-slate-200 p-3 font-semibold transition hover:border-emerald-300 hover:bg-emerald-50"
+            >
+              <span>Scan invoice</span>
+              <span className="text-emerald-700">→</span>
+            </NavLink>
+
+          </div>
+
+        </Card>
+
+      </div>
+
+    </div>
+  )
+}
+
+/* =========================================================
+   INVENTORY
+========================================================= */
+
+function Inventory({
+  session,
+  products,
+  refresh,
+}: Ctx) {
+  const [name, setName] = useState('')
+  const [price, setPrice] = useState('')
+  const [stock, setStock] = useState('')
+
+  const add = async (e: FormEvent) => {
+    e.preventDefault()
+
+    const time = now()
+    const productId = id()
+    const transactionId = id()
+
+    const p: Product = {
+      id: productId,
+      productId,
+      shopId: session.shopId,
+      name,
+      sku: '',
+      unit: 'unit',
+      purchasePrice: 0,
+      sellingPrice: +price,
+      minimumStock: 5,
+      currentStock: +stock,
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    const m: StockMovement = {
+      id: id(),
+      shopId: session.shopId,
+      transactionId,
+      productId,
+      quantity: +stock,
+      type: 'PURCHASE',
+      direction: 'IN',
+      referenceId: productId,
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.transaction(
+      'rw',
+      localDb.products,
+      localDb.stockMovements,
+      localDb.outbox,
+      async () => {
+        await localDb.products.put(p)
+        await localDb.stockMovements.put(m)
+
+        await enqueue({
+          transactionId,
+          entityId: productId,
+          action: 'CREATE',
+          endpoint: '/api/products',
+          method: 'POST',
+          payload: p,
+        })
+      },
+    )
+
+    setName('')
+    setPrice('')
+    setStock('')
+
+    await refresh()
+  }
+
+  return (
+    <div className="space-y-5">
+
+      <PageHeader
+        eyebrow="PRODUCT MANAGEMENT"
+        title="Inventory"
+        description="Manage products, prices and available stock."
+      />
+
+      <Card>
+
+        <form
+          onSubmit={add}
+          className="grid gap-3 md:grid-cols-4"
+        >
+
+          <Input
+            placeholder="Product name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+          />
+
+          <Input
+            type="number"
+            min="0"
+            placeholder="Selling price"
+            value={price}
+            onChange={(e) => setPrice(e.target.value)}
+            required
+          />
+
+          <Input
+            type="number"
+            min="0"
+            placeholder="Opening stock"
+            value={stock}
+            onChange={(e) => setStock(e.target.value)}
+            required
+          />
+
+          <PrimaryButton>
+            + Add product
+          </PrimaryButton>
+
+        </form>
+
+      </Card>
+
+      {products.length === 0 ? (
+        <EmptyState
+          icon="📦"
+          title="No products yet"
+          text="Add your first product above to start managing inventory."
+        />
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+
+          {products.map((p) => (
+            <Card key={p.id}>
+
+              <div className="flex items-start justify-between gap-3">
+
+                <div>
+                  <h3 className="font-bold text-slate-950">
+                    {p.name}
+                  </h3>
+
+                  <p className="mt-1 text-sm text-slate-500">
+                    {money(p.sellingPrice)} per {p.unit}
+                  </p>
+                </div>
+
+                <span
+                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                    p.currentStock <= p.minimumStock
+                      ? 'bg-amber-50 text-amber-700'
+                      : 'bg-emerald-50 text-emerald-700'
+                  }`}
+                >
+                  {p.currentStock <= p.minimumStock
+                    ? 'Low stock'
+                    : 'Healthy'}
+                </span>
+
+              </div>
+
+              <div className="mt-5 rounded-xl bg-slate-50 p-4">
+
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-400">
+                  Current stock
+                </p>
+
+                <p className="mt-1 text-2xl font-bold">
+                  {p.currentStock}
+                </p>
+
+              </div>
+
+            </Card>
+          ))}
+
+        </div>
+      )}
+
+    </div>
+  )
+}
+
+/* =========================================================
+   KHATA
+========================================================= */
+
+function Khata({
+  session,
+  customers,
+  refresh,
+}: Ctx) {
+  const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [selected, setSelected] = useState('')
+  const [amount, setAmount] = useState('')
+  const [ledger, setLedger] = useState<LedgerTransaction[]>([])
+
+  useEffect(() => {
+    void localDb.ledgerTransactions
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+      .then(setLedger)
+  }, [session.shopId, customers])
+
+  const add = async (e: FormEvent) => {
+    e.preventDefault()
+
+    const time = now()
+    const customerId = id()
+
+    const customer: Customer = {
+      id: customerId,
+      customerId,
+      shopId: session.shopId,
+      name,
+      phone,
+      openingBalance: 0,
+      interestEnabled: false,
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.transaction(
+      'rw',
+      localDb.customers,
+      localDb.outbox,
+      async () => {
+        await localDb.customers.put(customer)
+
+        await enqueue({
+          transactionId: id(),
+          entityId: customerId,
+          action: 'CREATE',
+          endpoint: '/api/customers',
+          method: 'POST',
+          payload: customer,
+        })
+      },
+    )
+
+    setName('')
+    setPhone('')
+
+    await refresh()
+  }
+
+  const pay = async () => {
+    if (!selected || +amount <= 0) return
+
+    const time = now()
+    const transactionId = id()
+
+    const payment: Payment = {
+      id: id(),
+      paymentId: id(),
+      shopId: session.shopId,
+      customerId: selected,
+      amount: +amount,
+      status: 'SUCCESS',
+      provider: 'CASH',
+      transactionId,
+      verifiedAt: time,
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    const entry: LedgerTransaction = {
+      id: id(),
+      shopId: session.shopId,
+      transactionId: `${transactionId}:ledger`,
+      customerId: selected,
+      type: 'PAYMENT',
+      direction: 'CREDIT',
+      amount: +amount,
+      referenceId: payment.paymentId,
+      description: 'Cash payment',
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.transaction(
+      'rw',
+      localDb.payments,
+      localDb.ledgerTransactions,
+      localDb.outbox,
+      async () => {
+        await localDb.payments.put(payment)
+        await localDb.ledgerTransactions.put(entry)
+
+        await enqueue({
+          transactionId,
+          entityId: payment.paymentId,
+          action: 'CREATE',
+          endpoint: '/api/payments',
+          method: 'POST',
+          payload: payment,
+        })
+      },
+    )
+
+    setAmount('')
+
+    await refresh()
+
+    setLedger(
+      await localDb.ledgerTransactions
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+  }
+
+  const bal = (c: Customer) =>
+    c.openingBalance +
+    ledger
+      .filter((l) => l.customerId === c.customerId)
+      .reduce(
+        (n, l) =>
+          n + (l.direction === 'DEBIT' ? l.amount : -l.amount),
+        0,
+      )
+
+  return (
+    <div className="space-y-5">
+
+      <PageHeader
+        eyebrow="CUSTOMER CREDIT"
+        title="Khata"
+        description="Track customers, credit balances and payments."
+      />
+
+      <Card>
+
+        <form
+          onSubmit={add}
+          className="grid gap-3 md:grid-cols-[1fr_1fr_auto]"
+        >
+
+          <Input
+            placeholder="Customer name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+          />
+
+          <Input
+            placeholder="Phone"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            required
+          />
+
+          <PrimaryButton>
+            + Add customer
+          </PrimaryButton>
+
+        </form>
+
+      </Card>
+
+      <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
+
+        <div className="space-y-3">
+
+          {customers.length === 0 ? (
+            <EmptyState
+              icon="📒"
+              title="No customers yet"
+              text="Add a customer above to start using Khata."
+            />
+          ) : (
+            customers.map((c) => (
+              <button
+                className={`block w-full rounded-2xl border bg-white p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${
+                  selected === c.customerId
+                    ? 'border-emerald-500 ring-4 ring-emerald-50'
+                    : 'border-slate-200'
+                }`}
+                onClick={() => setSelected(c.customerId)}
+                key={c.id}
+              >
+
+                <div className="flex items-center justify-between">
+
+                  <div>
+                    <b className="text-base">
+                      {c.name}
+                    </b>
+
+                    <p className="mt-1 text-sm text-slate-500">
+                      {c.phone}
+                    </p>
+                  </div>
+
+                  <div className="text-right">
+
+                    <p className="text-xs text-slate-400">
+                      Due
+                    </p>
+
+                    <p
+                      className={`font-bold ${
+                        bal(c) > 0
+                          ? 'text-amber-700'
+                          : 'text-emerald-700'
+                      }`}
+                    >
+                      {money(bal(c))}
+                    </p>
+
+                  </div>
+
+                </div>
+
+              </button>
+            ))
+          )}
+
+        </div>
+
+        <Card>
+
+          <div className="flex items-center gap-3">
+
+            <div className="grid h-10 w-10 place-items-center rounded-xl bg-emerald-50 text-emerald-700">
+              ₹
+            </div>
+
+            <div>
+              <h2 className="font-bold">
+                Record payment
+              </h2>
+
+              <p className="text-xs text-slate-500">
+                Save a customer payment.
+              </p>
+            </div>
+
+          </div>
+
+          <Select
+            className="mt-5"
+            value={selected}
+            onChange={(e) => setSelected(e.target.value)}
+          >
+            <option value="">
+              Choose customer
+            </option>
+
+            {customers.map((c) => (
+              <option
+                key={c.id}
+                value={c.customerId}
+              >
+                {c.name}
+              </option>
+            ))}
+          </Select>
+
+          <Input
+            className="mt-3"
+            type="number"
+            min="1"
+            placeholder="Amount received"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+
+          <PrimaryButton
+            className="mt-3 w-full"
+            onClick={pay}
+          >
+            Save cash payment
+          </PrimaryButton>
+
+          {selected && (
+            <div className="mt-6 border-t border-slate-100 pt-5">
+
+              <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Transaction history
+              </p>
+
+              <div className="space-y-2">
+
+                {ledger
+                  .filter((l) => l.customerId === selected)
+                  .sort((a, b) =>
+                    a.createdAt.localeCompare(b.createdAt),
+                  )
+                  .map((l) => (
+                    <div
+                      className="flex items-center justify-between rounded-xl bg-slate-50 p-3 text-sm"
+                      key={l.id}
+                    >
+                      <span className="text-slate-600">
+                        {l.description}
+                      </span>
+
+                      <b
+                        className={
+                          l.direction === 'DEBIT'
+                            ? 'text-amber-700'
+                            : 'text-emerald-700'
+                        }
+                      >
+                        {l.direction === 'DEBIT' ? '+' : '-'}
+                        {money(l.amount)}
+                      </b>
+                    </div>
+                  ))}
+
+              </div>
+
+            </div>
+          )}
+
+        </Card>
+
+      </div>
+
+    </div>
+  )
+}
+
+/* =========================================================
+   POS
+========================================================= */
+
+function Pos({
+  session,
+  products,
+  customers,
+  refresh,
+}: Ctx) {
+  const [cart, setCart] = useState<Record<string, number>>({})
+  const [customerId, setCustomerId] = useState('')
+  const [method, setMethod] =
+    useState<'CASH' | 'CREDIT' | 'UPI'>('CASH')
+  const [showUpi, setShowUpi] = useState(false)
+
+  const total = useMemo(
+    () =>
+      products.reduce(
+        (n, p) =>
+          n + (cart[p.productId] || 0) * p.sellingPrice,
+        0,
+      ),
+    [products, cart],
+  )
+
+  const transactionId = id()
+
+  const upi =
+    `upi://pay?pa=saathikirana@upi` +
+    `&pn=Saathi%20Kirana%20Store` +
+    `&am=${total.toFixed(2)}` +
+    `&tn=DukaanSaathi%20sale` +
+    `&tr=${transactionId}`
+
+  const checkout = async () => {
+    const items = products
+      .filter((p) => cart[p.productId])
+      .map((p) => ({
+        saleItemId: id(),
+        saleId: '',
+        productId: p.productId,
+        quantity: cart[p.productId],
+        price: p.sellingPrice,
+        purchasePrice: p.purchasePrice,
+      }))
+
+    if (
+      !items.length ||
+      items.some(
+        (i) =>
+          products.find(
+            (p) => p.productId === i.productId,
+          )!.currentStock < i.quantity,
+      )
+    ) {
+      return alert('Add items within available stock')
+    }
+
+    if (method === 'CREDIT' && !customerId) {
+      return alert('Choose a customer for credit')
+    }
+
+    const time = now()
+    const saleId = id()
+    const tid = id()
+
+    items.forEach((i) => {
+      i.saleId = saleId
+    })
+
+    const sale: Sale = {
+      id: saleId,
+      saleId,
+      shopId: session.shopId,
+      customerId:
+        method === 'CREDIT' ? customerId : undefined,
+      items,
+      subtotal: total,
+      discount: 0,
+      tax: 0,
+      total,
+      paymentMethod: method,
+      paymentStatus:
+        method === 'CREDIT'
+          ? 'PENDING'
+          : method === 'UPI'
+            ? 'PENDING'
+            : 'SUCCESS',
+      transactionId: tid,
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.transaction(
+      'rw',
+      [
+        localDb.sales,
+        localDb.saleItems,
+        localDb.products,
+        localDb.stockMovements,
+        localDb.ledgerTransactions,
+        localDb.outbox,
+      ],
+      async () => {
+        await localDb.sales.put(sale)
+
+        await localDb.saleItems.bulkPut(
+          items as SaleItem[],
+        )
+
+        for (const i of items) {
+          const p = products.find(
+            (v) => v.productId === i.productId,
+          )!
+
+          await localDb.products.put({
+            ...p,
+            currentStock: p.currentStock - i.quantity,
+            updatedAt: time,
+          })
+
+          await localDb.stockMovements.put({
+            id: id(),
+            shopId: session.shopId,
+            transactionId: `${tid}:${i.productId}`,
+            productId: i.productId,
+            quantity: i.quantity,
+            type: 'SALE',
+            direction: 'OUT',
+            referenceId: saleId,
+            createdAt: time,
+            updatedAt: time,
+          })
+        }
+
+        if (method === 'CREDIT') {
+          await localDb.ledgerTransactions.put({
+            id: id(),
+            shopId: session.shopId,
+            transactionId: `${tid}:ledger`,
+            customerId,
+            type: 'SALE',
+            direction: 'DEBIT',
+            amount: total,
+            referenceId: saleId,
+            description: 'Credit sale',
+            createdAt: time,
+            updatedAt: time,
+          })
+        }
+
+        await enqueue({
+          transactionId: tid,
+          entityId: saleId,
+          action: 'CREATE',
+          endpoint: '/api/sales',
+          method: 'POST',
+          payload: sale,
+        })
+      },
+    )
+
+    setCart({})
+    setCustomerId('')
+
+    await refresh()
+
+    alert(`Receipt saved locally: ${money(total)}`)
+  }
+
+  return (
+    <div className="space-y-5">
+
+      <PageHeader
+        eyebrow="POINT OF SALE"
+        title="Point of sale"
+        description="Build a bill and complete a sale quickly."
+      />
+
+      <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
+
+        {/* PRODUCTS */}
+        <div>
+
+          <div className="mb-3 flex items-center justify-between">
+
+            <h2 className="font-bold text-slate-950">
+              Products
+            </h2>
+
+            <span className="text-xs text-slate-400">
+              {products.length} available
+            </span>
+
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+
+            {products.map((p) => (
+              <button
+                key={p.id}
+                disabled={!p.currentStock}
+                onClick={() =>
+                  setCart((c) => ({
+                    ...c,
+                    [p.productId]:
+                      (c[p.productId] || 0) + 1,
+                  }))
+                }
+                className="rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow-md disabled:cursor-not-allowed disabled:opacity-40"
+              >
+
+                <div className="flex items-start justify-between">
+
+                  <div>
+                    <b className="text-base">
+                      {p.name}
+                    </b>
+
+                    <p className="mt-1 text-sm text-slate-500">
+                      {money(p.sellingPrice)}
+                    </p>
+                  </div>
+
+                  <span className="rounded-lg bg-slate-100 px-2 py-1 text-xs text-slate-500">
+                    {p.currentStock} left
+                  </span>
+
+                </div>
+
+                <div className="mt-4 text-sm font-semibold text-emerald-700">
+                  + Add to bill
+                </div>
+
+              </button>
+            ))}
+
+          </div>
+
+        </div>
+
+        {/* BILL */}
+        <Card className="h-fit lg:sticky lg:top-36">
+
+          <div className="flex items-center justify-between">
+
+            <div>
+              <h2 className="text-lg font-bold">
+                Current bill
+              </h2>
+
+              <p className="text-xs text-slate-500">
+                {Object.values(cart).reduce(
+                  (a, b) => a + b,
+                  0,
+                )}{' '}
+                items
+              </p>
+            </div>
+
+            <div className="rounded-xl bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-700">
+              {money(total)}
+            </div>
+
+          </div>
+
+          <div className="mt-5 space-y-2">
+
+            {Object.entries(cart).length === 0 ? (
+              <div className="rounded-xl bg-slate-50 p-5 text-center text-sm text-slate-400">
+                Your bill is empty.
+                <br />
+                Select products to begin.
+              </div>
+            ) : (
+              Object.entries(cart).map(
+                ([pid, q]) => {
+                  const p = products.find(
+                    (v) => v.productId === pid,
+                  )!
+
+                  return (
+                    <div
+                      className="flex items-center justify-between rounded-xl bg-slate-50 p-3"
+                      key={pid}
+                    >
+
+                      <div>
+                        <p className="text-sm font-semibold">
+                          {p.name}
+                        </p>
+
+                        <p className="text-xs text-slate-500">
+                          {money(p.sellingPrice)} × {q}
+                        </p>
+                      </div>
+
+                      <button
+                        className="grid h-8 w-8 place-items-center rounded-lg border border-slate-200 bg-white font-bold text-slate-600"
+                        onClick={() =>
+                          setCart((c) => ({
+                            ...c,
+                            [pid]: Math.max(
+                              0,
+                              (c[pid] || 0) - 1,
+                            ),
+                          }))
+                        }
+                      >
+                        −
+                      </button>
+
+                    </div>
+                  )
+                },
+              )
+            )}
+
+          </div>
+
+          <div className="my-5 border-t border-slate-100 pt-4">
+
+            <div className="flex justify-between">
+              <span className="text-sm text-slate-500">
+                Total
+              </span>
+
+              <span className="text-2xl font-bold">
+                {money(total)}
+              </span>
+            </div>
+
+          </div>
+
+          <Select
+            value={method}
+            onChange={(e) =>
+              setMethod(
+                e.target.value as typeof method,
+              )
+            }
+          >
+            <option value="CASH">
+              Cash
+            </option>
+
+            <option value="UPI">
+              UPI (demo verification)
+            </option>
+
+            <option value="CREDIT">
+              Credit / Khata
+            </option>
+          </Select>
+
+          {method === 'CREDIT' && (
+            <Select
+              className="mt-3"
+              value={customerId}
+              onChange={(e) =>
+                setCustomerId(e.target.value)
+              }
+            >
+              <option value="">
+                Customer
+              </option>
+
+              {customers.map((c) => (
+                <option
+                  key={c.id}
+                  value={c.customerId}
+                >
+                  {c.name}
+                </option>
+              ))}
+            </Select>
+          )}
+
+          {method === 'UPI' && (
+            <button
+              onClick={() =>
+                setShowUpi(!showUpi)
+              }
+              className="mt-3 w-full rounded-xl border border-emerald-200 bg-emerald-50 p-3 font-semibold text-emerald-800"
+            >
+              {showUpi ? 'Hide' : 'Show'} UPI QR
+            </button>
+          )}
+
+          {showUpi && (
+            <div className="mt-3 grid place-items-center rounded-2xl bg-slate-50 p-5">
+
+              <QRCodeSVG
+                value={upi}
+                size={180}
+              />
+
+              <a
+                className="mt-3 text-sm font-semibold text-emerald-700"
+                href={upi}
+              >
+                Open UPI app
+              </a>
+
+              <small className="mt-2 text-center text-xs text-slate-500">
+                Demo verification only — confirm payment manually.
+              </small>
+
+            </div>
+          )}
+
+          <PrimaryButton
+            className="mt-4 w-full"
+            onClick={checkout}
+          >
+            Save {method.toLowerCase()} sale
+          </PrimaryButton>
+
+        </Card>
+
+      </div>
+
+    </div>
+  )
+}
+
+/* =========================================================
+   SUPPLIERS
+========================================================= */
+
+function Suppliers({
+  session,
+  products,
+  refresh,
+}: Ctx) {
+  const [name, setName] = useState('')
+  const [items, setItems] = useState<Supplier[]>([])
+  const [orders, setOrders] = useState<PurchaseOrder[]>([])
+
+  useEffect(() => {
+    void localDb.suppliers
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+      .then(setItems)
+
+    void localDb.purchaseOrders
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+      .then(setOrders)
+  }, [session.shopId])
+
+  const add = async (e: FormEvent) => {
+    e.preventDefault()
+
+    const time = now()
+    const supplierId = id()
+
+    const v: Supplier = {
+      id: supplierId,
+      supplierId,
+      shopId: session.shopId,
+      name,
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.transaction(
+      'rw',
+      localDb.suppliers,
+      localDb.outbox,
+      async () => {
+        await localDb.suppliers.put(v)
+
+        await enqueue({
+          transactionId: id(),
+          entityId: supplierId,
+          action: 'CREATE',
+          endpoint: '/api/suppliers',
+          method: 'POST',
+          payload: v,
+        })
+      },
+    )
+
+    setItems([...items, v])
+    setName('')
+  }
+
+  const order = async (supplierId: string) => {
+    const low = products.filter(
+      (p) => p.currentStock <= p.minimumStock,
+    )
+
+    if (!low.length) {
+      return alert('No low-stock products')
+    }
+
+    const time = now()
+    const purchaseOrderId = id()
+
+    const v: PurchaseOrder = {
+      id: purchaseOrderId,
+      purchaseOrderId,
+      shopId: session.shopId,
+      supplierId,
+      items: low.map((p) => ({
+        productId: p.productId,
+        quantity: Math.max(
+          1,
+          p.minimumStock * 2 - p.currentStock,
+        ),
+        price:
+          p.purchasePrice ||
+          p.sellingPrice,
+      })),
+      estimatedTotal: low.reduce(
+        (n, p) =>
+          n +
+          Math.max(
+            1,
+            p.minimumStock * 2 -
+              p.currentStock,
+          ) *
+            (p.purchasePrice ||
+              p.sellingPrice),
+        0,
+      ),
+      status: 'DRAFT',
+      transactionId: id(),
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.transaction(
+      'rw',
+      localDb.purchaseOrders,
+      localDb.outbox,
+      async () => {
+        await localDb.purchaseOrders.put(v)
+
+        await enqueue({
+          transactionId: v.transactionId,
+          entityId: purchaseOrderId,
+          action: 'CREATE',
+          endpoint: '/api/purchase-orders',
+          method: 'POST',
+          payload: v,
+        })
+      },
+    )
+
+    setOrders([...orders, v])
+
+    await refresh()
+  }
+
+  return (
+    <div className="space-y-5">
+
+      <PageHeader
+        eyebrow="SUPPLY CHAIN"
+        title="Suppliers"
+        description="Manage suppliers and create purchase drafts."
+      />
+
+      <Card>
+
+        <form
+          onSubmit={add}
+          className="grid gap-3 md:grid-cols-[1fr_auto]"
+        >
+
+          <Input
+            value={name}
+            onChange={(e) =>
+              setName(e.target.value)
+            }
+            placeholder="Supplier name"
+            required
+          />
+
+          <PrimaryButton>
+            + Add supplier
+          </PrimaryButton>
+
+        </form>
+
+      </Card>
+
+      {items.length === 0 ? (
+        <EmptyState
+          icon="🚚"
+          title="No suppliers yet"
+          text="Add your first supplier above."
+        />
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2">
+
+          {items.map((s) => (
+            <Card key={s.id}>
+
+              <div className="flex items-start justify-between">
+
+                <div>
+                  <h3 className="font-bold">
+                    {s.name}
+                  </h3>
+
+                  <p className="mt-1 text-sm text-slate-500">
+                    {
+                      orders.filter(
+                        (o) =>
+                          o.supplierId ===
+                          s.supplierId,
+                      ).length
+                    }{' '}
+                    purchase orders
+                  </p>
+                </div>
+
+                <span className="rounded-xl bg-slate-100 px-3 py-2 text-lg">
+                  🚚
+                </span>
+
+              </div>
+
+              <SecondaryButton
+                className="mt-5 w-full"
+                onClick={() =>
+                  void order(s.supplierId)
+                }
+              >
+                Create low-stock draft
+              </SecondaryButton>
+
+            </Card>
+          ))}
+
+        </div>
+      )}
+
+      {orders.length > 0 && (
+        <Card>
+
+          <div className="flex items-center justify-between">
+
+            <div>
+              <h2 className="font-bold">
+                Purchase drafts
+              </h2>
+
+              <p className="mt-1 text-sm text-slate-500">
+                Draft purchase orders generated from low stock.
+              </p>
+            </div>
+
+            <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
+              {orders.length}
+            </span>
+
+          </div>
+
+          <div className="mt-4 space-y-2">
+
+            {orders.map((o) => (
+              <div
+                className="flex flex-col justify-between gap-2 rounded-xl bg-slate-50 p-4 sm:flex-row sm:items-center"
+                key={o.id}
+              >
+
+                <div>
+                  <p className="font-semibold">
+                    {o.status}
+                  </p>
+
+                  <p className="text-xs text-slate-500">
+                    {o.items.length} items
+                  </p>
+                </div>
+
+                <b>
+                  {money(o.estimatedTotal)}
+                </b>
+
+              </div>
+            ))}
+
+          </div>
+
+        </Card>
+      )}
+
+    </div>
+  )
+}
+
+/* =========================================================
+   OCR
+========================================================= */
+
+function Ocr({
+  products,
+}: Ctx) {
+  const [file, setFile] = useState<File | null>(null)
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const run = async () => {
+    if (!file) return
+
+    setBusy(true)
+
+    try {
+      const { createWorker } =
+        await import('tesseract.js')
+
+      const worker =
+        await createWorker('eng')
+
+      const r = await worker.recognize(file)
+
+      setText(r.data.text)
+
+      await worker.terminate()
+    } catch {
+      setText(
+        'Could not read this image. Please enter the purchase lines manually.',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+
+      <PageHeader
+        eyebrow="SMART TOOLS"
+        title="Invoice OCR"
+        description="Extract text from supplier invoices and review it before using it."
+      />
+
+      <Card>
+
+        <div className="rounded-2xl border-2 border-dashed border-slate-200 bg-slate-50 p-8 text-center">
+
+          <div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-emerald-100 text-2xl">
+            📄
+          </div>
+
+          <h2 className="mt-4 font-bold">
+            Upload supplier invoice
+          </h2>
+
+          <p className="mx-auto mt-2 max-w-lg text-sm leading-6 text-slate-500">
+            OCR only creates a review draft. Stock never changes until
+            you confirm it.
+          </p>
+
+          <input
+            className="mx-auto mt-5 block max-w-sm text-sm"
+            accept="image/*"
+            type="file"
+            onChange={(e) =>
+              setFile(
+                e.target.files?.[0] || null,
+              )
+            }
+          />
+
+          <PrimaryButton
+            disabled={!file || busy}
+            onClick={run}
+            className="mt-5"
+          >
+            {busy
+              ? 'Reading invoice…'
+              : 'Extract text'}
+          </PrimaryButton>
+
+        </div>
+
+        {text && (
+          <div className="mt-5">
+
+            <div className="mb-2 flex items-center justify-between">
+
+              <h3 className="font-bold">
+                Extracted text
+              </h3>
+
+              <span className="text-xs text-slate-400">
+                Review before use
+              </span>
+
+            </div>
+
+            <textarea
+              className="min-h-56 w-full rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm outline-none focus:border-emerald-600 focus:ring-4 focus:ring-emerald-100"
+              value={text}
+              onChange={(e) =>
+                setText(e.target.value)
+              }
+            />
+
+            <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Review product mappings, quantities and prices before creating a purchase.
+            </div>
+
+            <p className="mt-2 text-xs text-slate-500">
+              {products.length} local products available for matching.
+            </p>
+
+          </div>
+        )}
+
+      </Card>
+
+    </div>
+  )
+}
+
+/* =========================================================
+   SMALL UI HELPERS
+========================================================= */
+
+function PageHeader({
+  eyebrow,
+  title,
+  description,
+}: {
+  eyebrow: string
+  title: string
+  description: string
+}) {
+  return (
+    <div>
+
+      <p className="text-xs font-bold tracking-[0.16em] text-emerald-700">
+        {eyebrow}
+      </p>
+
+      <h1 className="mt-2 text-3xl font-bold tracking-tight text-slate-950 sm:text-4xl">
+        {title}
+      </h1>
+
+      <p className="mt-2 text-sm text-slate-500">
+        {description}
+      </p>
+
+    </div>
+  )
+}
+
+function EmptyState({
+  icon,
+  title,
+  text,
+}: {
+  icon: string
+  title: string
+  text: string
+}) {
+  return (
+    <Card className="py-12 text-center">
+
+      <div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-slate-100 text-2xl">
+        {icon}
+      </div>
+
+      <h3 className="mt-4 font-bold">
+        {title}
+      </h3>
+
+      <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
+        {text}
+      </p>
+
+    </Card>
+  )
+}
