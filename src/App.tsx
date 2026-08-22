@@ -43,6 +43,147 @@ const money = (n: number) =>
   }).format(n)
 
 /* =========================================================
+   CUSTOMER PURCHASE HISTORY (khata bill breakdown)
+========================================================= */
+
+type BillItemLine = {
+  productId: string
+  name: string
+  quantity: number
+  price: number
+  lineTotal: number
+}
+
+type CustomerBill = {
+  id: string
+  date: string
+  label: string
+  items: BillItemLine[]
+  subtotal?: number
+  discount?: number
+  total: number
+  amountPaid: number
+  amountDue: number
+  status: 'PAID' | 'PARTIAL' | 'DUE'
+  clearedAt?: string
+}
+
+// Builds a per-bill breakdown for a customer: every credit sale (with its
+// items, discount and total) plus the opening balance, and works out -
+// using a simple oldest-debt-first allocation of payments - how much of
+// each bill is paid, whether it is fully cleared, and when.
+function buildCustomerBills(
+  customer: Customer,
+  sales: Sale[],
+  ledger: LedgerTransaction[],
+  products: Product[],
+): CustomerBill[] {
+  const productName = (pid: string) =>
+    products.find((p) => p.productId === pid)?.name ?? 'Item'
+
+  const custLedger = ledger.filter(
+    (l) => l.customerId === customer.customerId,
+  )
+
+  type Debit = {
+    id: string
+    date: string
+    label: string
+    total: number
+    sale?: Sale
+  }
+
+  const debits: Debit[] = []
+
+  if (customer.openingBalance > 0) {
+    debits.push({
+      id: `opening-${customer.customerId}`,
+      date: customer.createdAt,
+      label: 'Opening balance',
+      total: customer.openingBalance,
+    })
+  }
+
+  custLedger
+    .filter((l) => l.direction === 'DEBIT')
+    .forEach((l) => {
+      const sale =
+        l.type === 'SALE'
+          ? sales.find((s) => s.saleId === l.referenceId)
+          : undefined
+
+      debits.push({
+        id: l.id,
+        date: l.createdAt,
+        label: sale ? 'Credit purchase' : l.description,
+        total: l.amount,
+        sale,
+      })
+    })
+
+  debits.sort((a, b) => a.date.localeCompare(b.date))
+
+  const credits = custLedger
+    .filter((l) => l.direction === 'CREDIT')
+    .map((l) => ({ date: l.createdAt, remaining: l.amount }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+
+  const bills = debits.map((d) => {
+    let remainingDue = d.total
+    let clearedAt: string | undefined
+
+    for (const credit of credits) {
+      if (remainingDue <= 0) break
+      if (credit.remaining <= 0) continue
+
+      const applied = Math.min(remainingDue, credit.remaining)
+      remainingDue -= applied
+      credit.remaining -= applied
+
+      if (remainingDue <= 0) {
+        clearedAt = credit.date
+      }
+    }
+
+    const amountPaid = d.total - remainingDue
+
+    const status: CustomerBill['status'] =
+      remainingDue <= 0
+        ? 'PAID'
+        : amountPaid > 0
+          ? 'PARTIAL'
+          : 'DUE'
+
+    const items: BillItemLine[] = d.sale
+      ? d.sale.items.map((it) => ({
+          productId: it.productId,
+          name: productName(it.productId),
+          quantity: it.quantity,
+          price: it.price,
+          lineTotal: it.price * it.quantity,
+        }))
+      : []
+
+    return {
+      id: d.id,
+      date: d.date,
+      label: d.label,
+      items,
+      subtotal: d.sale?.subtotal,
+      discount: d.sale?.discount,
+      total: d.total,
+      amountPaid,
+      amountDue: remainingDue,
+      status,
+      clearedAt,
+    }
+  })
+
+  // Most recent bill first.
+  return bills.sort((a, b) => b.date.localeCompare(a.date))
+}
+
+/* =========================================================
    REUSABLE UI
 ========================================================= */
 
@@ -1272,27 +1413,19 @@ function Inventory({
 function Khata({
   session,
   customers,
+  products,
   refresh,
 }: Ctx) {
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [givenAmount, setGivenAmount] = useState('')
-  const [givenDateTime, setGivenDateTime] = useState('')
   const [selected, setSelected] = useState('')
   const [amount, setAmount] = useState('')
-  const [paymentDateTime, setPaymentDateTime] = useState('')
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
-
-  // Converts a <input type="datetime-local"> value into an ISO timestamp.
-  // Falls back to the current time when the field is left blank.
-  const toIsoOrNow = (value: string) => {
-    if (!value) return now()
-
-    const parsed = new Date(value)
-    if (Number.isNaN(parsed.getTime())) return now()
-
-    return parsed.toISOString()
-  }
+  const [sales, setSales] = useState<Sale[]>([])
+  const [historyCustomerId, setHistoryCustomerId] = useState<
+    string | null
+  >(null)
 
   const loadLedger = async () => {
     setLedger(
@@ -1303,15 +1436,25 @@ function Khata({
     )
   }
 
+  const loadSales = async () => {
+    setSales(
+      await localDb.sales
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+  }
+
   useEffect(() => {
     void loadLedger()
+    void loadSales()
   }, [session.shopId, customers])
 
   const add = async (e: FormEvent) => {
     e.preventDefault()
 
     const openingAmount = Math.max(0, Number(givenAmount) || 0)
-    const time = toIsoOrNow(givenDateTime)
+    const time = now()
     const customerId = id()
     const transactionId = id()
 
@@ -1348,7 +1491,6 @@ function Khata({
     setName('')
     setPhone('')
     setGivenAmount('')
-    setGivenDateTime('')
 
     await refresh()
     await loadLedger()
@@ -1372,123 +1514,13 @@ function Khata({
     (c) => c.customerId === selected,
   )
 
-  const [customerSort, setCustomerSort] = useState<
-    | 'default'
-    | 'dueDesc'
-    | 'dueAsc'
-    | 'advanceDesc'
-    | 'advanceAsc'
-    | 'daysDesc'
-    | 'daysAsc'
-  >('default')
+  const historyCustomer = customers.find(
+    (c) => c.customerId === historyCustomerId,
+  )
 
-  const PENDING_FILTER_OPTIONS = [
-    500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000,
-    9000, 10000,
-  ] as const
-
-  const [pendingFilter, setPendingFilter] = useState<
-    'all' | (typeof PENDING_FILTER_OPTIONS)[number]
-  >('all')
-
-  // Pending due = positive balance (customer owes us), Advance = negative balance (we owe customer / customer overpaid).
-  const dueAmount = (balance: number) =>
-    balance > 0 ? balance : 0
-
-  const advanceAmount = (balance: number) =>
-    balance < 0 ? Math.abs(balance) : 0
-
-  // Earliest date this customer started owing money that is still unpaid,
-  // based on the opening balance and any DEBIT (credit given) ledger entries.
-  const oldestDueTimestamp = (c: Customer) => {
-    const timestamps: number[] = []
-
-    if (c.openingBalance > 0) {
-      timestamps.push(new Date(c.createdAt).getTime())
-    }
-
-    ledger
-      .filter(
-        (l) =>
-          l.customerId === c.customerId &&
-          l.direction === 'DEBIT',
-      )
-      .forEach((l) =>
-        timestamps.push(new Date(l.createdAt).getTime()),
-      )
-
-    if (timestamps.length === 0) return null
-
-    return Math.min(...timestamps)
-  }
-
-  // Number of days a customer's current due has been outstanding.
-  // Customers with no due are treated as 0 days.
-  const daysPending = (c: Customer, balance: number) => {
-    if (balance <= 0) return 0
-
-    const oldest = oldestDueTimestamp(c)
-    if (oldest === null) return 0
-
-    const diffMs = Date.now() - oldest
-    return Math.max(
-      0,
-      Math.floor(diffMs / (1000 * 60 * 60 * 24)),
-    )
-  }
-
-  const sortedCustomers = useMemo(() => {
-    const filtered =
-      pendingFilter === 'all'
-        ? customers
-        : customers.filter(
-            (c) => dueAmount(balanceFor(c)) > pendingFilter,
-          )
-
-    if (customerSort === 'default') return filtered
-
-    const withBalance = filtered.map((c) => {
-      const balance = balanceFor(c)
-
-      return {
-        customer: c,
-        balance,
-        days: daysPending(c, balance),
-      }
-    })
-
-    withBalance.sort((a, b) => {
-      switch (customerSort) {
-        case 'dueDesc':
-          return (
-            dueAmount(b.balance) - dueAmount(a.balance)
-          )
-        case 'dueAsc':
-          return (
-            dueAmount(a.balance) - dueAmount(b.balance)
-          )
-        case 'advanceDesc':
-          return (
-            advanceAmount(b.balance) -
-            advanceAmount(a.balance)
-          )
-        case 'advanceAsc':
-          return (
-            advanceAmount(a.balance) -
-            advanceAmount(b.balance)
-          )
-        case 'daysDesc':
-          return b.days - a.days
-        case 'daysAsc':
-          return a.days - b.days
-        default:
-          return 0
-      }
-    })
-
-    return withBalance.map((w) => w.customer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [customers, ledger, customerSort, pendingFilter])
+  const historyBills = historyCustomer
+    ? buildCustomerBills(historyCustomer, sales, ledger, products)
+    : []
 
   const pay = async () => {
     if (!selectedCustomer) {
@@ -1505,35 +1537,30 @@ function Khata({
 
     const due = balanceFor(selectedCustomer)
 
-    if (received > due) {
-      const advanceAmount = received - due
-
-      if (due > 0) {
+    if (due <= 0) {
+      if (due < 0) {
         alert(
-          `This clears the outstanding due of ${money(
-            due,
-          )} and records the remaining ${money(
-            advanceAmount,
-          )} as an advance from the customer.`,
-        )
-      } else if (due === 0) {
-        alert(
-          `This customer has no outstanding due. ${money(
-            advanceAmount,
-          )} will be recorded as an advance from the customer.`,
+          `This customer has already paid ${money(
+            Math.abs(due),
+          )} in advance.`,
         )
       } else {
-        alert(
-          `This adds ${money(
-            advanceAmount,
-          )} to the customer's existing advance of ${money(
-            Math.abs(due),
-          )}.`,
-        )
+        alert('This customer has no outstanding due.')
       }
+
+      return
     }
 
-    const time = toIsoOrNow(paymentDateTime)
+    if (received > due) {
+      alert(
+        `You can receive maximum ${money(
+          due,
+        )} because that is the current outstanding due.`,
+      )
+      return
+    }
+
+    const time = now()
     const transactionId = id()
 
     const payment: Payment = {
@@ -1585,7 +1612,6 @@ function Khata({
     )
 
     setAmount('')
-    setPaymentDateTime('')
     await refresh()
     await loadLedger()
   }
@@ -1659,7 +1685,7 @@ function Khata({
 
         <form
           onSubmit={add}
-          className="grid gap-3 md:grid-cols-5"
+          className="grid gap-3 md:grid-cols-4"
         >
           <Input
             placeholder="Customer name"
@@ -1687,20 +1713,6 @@ function Khata({
             required
           />
 
-          <div>
-            <label className="mb-1 block text-xs font-semibold text-slate-500">
-              Date &amp; time (optional)
-            </label>
-
-            <Input
-              type="datetime-local"
-              value={givenDateTime}
-              onChange={(e) =>
-                setGivenDateTime(e.target.value)
-              }
-            />
-          </div>
-
           <PrimaryButton>
             + Add customer
           </PrimaryButton>
@@ -1710,84 +1722,14 @@ function Khata({
       <div className="grid gap-5 lg:grid-cols-[1fr_420px]">
         {/* CUSTOMER LIST */}
         <div className="space-y-3">
-          {customers.length > 0 && (
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <h2 className="font-bold text-slate-950">
-                Customers
-              </h2>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <select
-                  value={pendingFilter}
-                  onChange={(e) =>
-                    setPendingFilter(
-                      (e.target.value === 'all'
-                        ? 'all'
-                        : Number(
-                            e.target.value,
-                          )) as typeof pendingFilter,
-                    )
-                  }
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
-                >
-                  <option value="all">
-                    Filter: All customers
-                  </option>
-
-                  {PENDING_FILTER_OPTIONS.map((amt) => (
-                    <option key={amt} value={amt}>
-                      Pending above {money(amt)}
-                    </option>
-                  ))}
-                </select>
-
-                <select
-                  value={customerSort}
-                  onChange={(e) =>
-                    setCustomerSort(
-                      e.target.value as typeof customerSort,
-                    )
-                  }
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
-                >
-                  <option value="default">Sort by</option>
-                  <option value="dueDesc">
-                    Pending due: High to Low
-                  </option>
-                  <option value="dueAsc">
-                    Pending due: Low to High
-                  </option>
-                  <option value="advanceDesc">
-                    Advance received: High to Low
-                  </option>
-                  <option value="advanceAsc">
-                    Advance received: Low to High
-                  </option>
-                  <option value="daysDesc">
-                    Pending since: Max days to Min days
-                  </option>
-                  <option value="daysAsc">
-                    Pending since: Min days to Max days
-                  </option>
-                </select>
-              </div>
-            </div>
-          )}
-
           {customers.length === 0 ? (
             <EmptyState
               icon="📒"
               title="No customers yet"
               text="Add a customer above to start using Khata."
             />
-          ) : sortedCustomers.length === 0 ? (
-            <EmptyState
-              icon="🔍"
-              title="No customers match this filter"
-              text="Try a lower pending amount or clear the filter."
-            />
           ) : (
-            sortedCustomers.map((c) => {
+            customers.map((c) => {
               const balance = balanceFor(c)
 
               const received = ledger
@@ -1803,7 +1745,6 @@ function Khata({
 
               const hasDue = balance > 0
               const hasAdvance = balance < 0
-              const pendingDays = daysPending(c, balance)
 
               return (
                 <button
@@ -1820,9 +1761,16 @@ function Khata({
                 >
                   <div className="flex items-center justify-between gap-4">
                     <div>
-                      <b className="text-base">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setHistoryCustomerId(c.customerId)
+                        }}
+                        className="text-base font-bold text-slate-950 underline decoration-dotted decoration-slate-300 underline-offset-4 transition hover:text-emerald-700 hover:decoration-emerald-400"
+                      >
                         {c.name}
-                      </b>
+                      </button>
 
                       <p className="mt-1 text-sm text-slate-500">
                         {c.phone}
@@ -1849,15 +1797,6 @@ function Khata({
 
                           <p className="text-xl font-bold text-amber-700">
                             {money(balance)}
-                          </p>
-
-                          <p className="mt-1 text-xs font-semibold text-amber-600">
-                            Pending{' '}
-                            {pendingDays === 0
-                              ? 'since today'
-                              : pendingDays === 1
-                                ? 'for 1 day'
-                                : `for ${pendingDays} days`}
                           </p>
                         </>
                       ) : hasAdvance ? (
@@ -1996,29 +1935,24 @@ function Khata({
             onChange={(e) =>
               setAmount(e.target.value)
             }
-            disabled={!selectedCustomer}
+            disabled={
+              !selectedCustomer ||
+              balanceFor(
+                selectedCustomer as Customer,
+              ) <= 0
+            }
           />
-
-          <div className="mt-3">
-            <label className="mb-1 block text-xs font-semibold text-slate-500">
-              Date &amp; time (optional)
-            </label>
-
-            <Input
-              type="datetime-local"
-              value={paymentDateTime}
-              onChange={(e) =>
-                setPaymentDateTime(e.target.value)
-              }
-              disabled={!selectedCustomer}
-            />
-          </div>
 
           <PrimaryButton
             type="button"
             className="mt-3 w-full"
             onClick={pay}
-            disabled={!selectedCustomer}
+            disabled={
+              !selectedCustomer ||
+              balanceFor(
+                selectedCustomer as Customer,
+              ) <= 0
+            }
           >
             Save cash payment
           </PrimaryButton>
@@ -2144,6 +2078,200 @@ function Khata({
             </div>
           )}
         </Card>
+      </div>
+
+      {historyCustomer && (
+        <CustomerHistoryModal
+          customer={historyCustomer}
+          bills={historyBills}
+          onClose={() => setHistoryCustomerId(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+/* =========================================================
+   CUSTOMER HISTORY MODAL
+========================================================= */
+
+function CustomerHistoryModal({
+  customer,
+  bills,
+  onClose,
+}: {
+  customer: Customer
+  bills: CustomerBill[]
+  onClose: () => void
+}) {
+  const totalDue = bills.reduce((n, b) => n + b.amountDue, 0)
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/50 p-4 pt-10 backdrop-blur-sm"
+      role="presentation"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose()
+      }}
+    >
+      <div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-5">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Purchase history
+            </p>
+
+            <h2 className="mt-1 text-lg font-bold text-slate-950">
+              {customer.name}
+            </h2>
+
+            <p className="mt-1 text-sm text-slate-500">
+              {customer.phone}
+            </p>
+
+            <p className="mt-2 text-sm font-semibold text-amber-700">
+              {totalDue > 0
+                ? `Total due: ${money(totalDue)}`
+                : 'No amount due'}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-slate-200 text-slate-500 transition hover:bg-slate-50"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="max-h-[70vh] space-y-3 overflow-y-auto p-5">
+          {bills.length === 0 ? (
+            <div className="rounded-xl bg-slate-50 p-6 text-center text-sm text-slate-500">
+              No purchase records yet for this customer.
+            </div>
+          ) : (
+            bills.map((bill) => (
+              <div
+                key={bill.id}
+                className="rounded-2xl border border-slate-200 p-4"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-bold text-slate-900">
+                      {bill.label}
+                    </p>
+
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      {new Date(bill.date).toLocaleString(
+                        'en-IN',
+                        {
+                          day: '2-digit',
+                          month: 'short',
+                          year: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        },
+                      )}
+                    </p>
+                  </div>
+
+                  <span
+                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                      bill.status === 'PAID'
+                        ? 'bg-emerald-50 text-emerald-700'
+                        : bill.status === 'PARTIAL'
+                          ? 'bg-amber-50 text-amber-700'
+                          : 'bg-rose-50 text-rose-700'
+                    }`}
+                  >
+                    {bill.status === 'PAID'
+                      ? 'Cleared'
+                      : bill.status === 'PARTIAL'
+                        ? 'Partially paid'
+                        : 'Due'}
+                  </span>
+                </div>
+
+                {bill.items.length > 0 && (
+                  <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-3">
+                    {bill.items.map((item, idx) => (
+                      <div
+                        className="flex items-center justify-between text-sm"
+                        key={`${bill.id}-${item.productId}-${idx}`}
+                      >
+                        <span className="text-slate-600">
+                          {item.name}{' '}
+                          <span className="text-slate-400">
+                            × {item.quantity} @{' '}
+                            {money(item.price)}
+                          </span>
+                        </span>
+
+                        <span className="font-medium text-slate-800">
+                          {money(item.lineTotal)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="mt-3 space-y-1 border-t border-slate-100 pt-3 text-sm">
+                  {bill.subtotal !== undefined && (
+                    <div className="flex justify-between text-slate-500">
+                      <span>Subtotal</span>
+                      <span>{money(bill.subtotal)}</span>
+                    </div>
+                  )}
+
+                  {!!bill.discount && (
+                    <div className="flex justify-between text-slate-500">
+                      <span>Discount</span>
+                      <span>
+                        − {money(bill.discount)}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="flex justify-between font-bold text-slate-900">
+                    <span>Total bill</span>
+                    <span>{money(bill.total)}</span>
+                  </div>
+
+                  {bill.amountPaid > 0 && (
+                    <div className="flex justify-between text-emerald-700">
+                      <span>Paid</span>
+                      <span>{money(bill.amountPaid)}</span>
+                    </div>
+                  )}
+
+                  {bill.amountDue > 0 && (
+                    <div className="flex justify-between font-semibold text-amber-700">
+                      <span>Due</span>
+                      <span>{money(bill.amountDue)}</span>
+                    </div>
+                  )}
+
+                  {bill.status === 'PAID' && bill.clearedAt && (
+                    <div className="flex justify-between text-xs text-slate-400">
+                      <span>Cleared on</span>
+                      <span>
+                        {new Date(
+                          bill.clearedAt,
+                        ).toLocaleDateString('en-IN', {
+                          day: '2-digit',
+                          month: 'short',
+                          year: 'numeric',
+                        })}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
       </div>
     </div>
   )
