@@ -19,6 +19,7 @@ import type {
   Customer,
   LedgerTransaction,
   Payment,
+  PaymentStatus,
   Product,
   PurchaseOrder,
   Sale,
@@ -41,6 +42,147 @@ const money = (n: number) =>
     currency: 'INR',
     maximumFractionDigits: 0,
   }).format(n)
+
+/* =========================================================
+   CUSTOMER PURCHASE HISTORY (khata bill breakdown)
+========================================================= */
+
+type BillItemLine = {
+  productId: string
+  name: string
+  quantity: number
+  price: number
+  lineTotal: number
+}
+
+type CustomerBill = {
+  id: string
+  date: string
+  label: string
+  items: BillItemLine[]
+  subtotal?: number
+  discount?: number
+  total: number
+  amountPaid: number
+  amountDue: number
+  status: 'PAID' | 'PARTIAL' | 'DUE'
+  clearedAt?: string
+}
+
+// Builds a per-bill breakdown for a customer: every credit sale (with its
+// items, discount and total) plus the opening balance, and works out -
+// using a simple oldest-debt-first allocation of payments - how much of
+// each bill is paid, whether it is fully cleared, and when.
+function buildCustomerBills(
+  customer: Customer,
+  sales: Sale[],
+  ledger: LedgerTransaction[],
+  products: Product[],
+): CustomerBill[] {
+  const productName = (pid: string) =>
+    products.find((p) => p.productId === pid)?.name ?? 'Item'
+
+  const custLedger = ledger.filter(
+    (l) => l.customerId === customer.customerId,
+  )
+
+  type Debit = {
+    id: string
+    date: string
+    label: string
+    total: number
+    sale?: Sale
+  }
+
+  const debits: Debit[] = []
+
+  if (customer.openingBalance > 0) {
+    debits.push({
+      id: `opening-${customer.customerId}`,
+      date: customer.createdAt,
+      label: 'Opening balance',
+      total: customer.openingBalance,
+    })
+  }
+
+  custLedger
+    .filter((l) => l.direction === 'DEBIT')
+    .forEach((l) => {
+      const sale =
+        l.type === 'SALE'
+          ? sales.find((s) => s.saleId === l.referenceId)
+          : undefined
+
+      debits.push({
+        id: l.id,
+        date: l.createdAt,
+        label: sale ? 'Credit purchase' : l.description,
+        total: l.amount,
+        sale,
+      })
+    })
+
+  debits.sort((a, b) => a.date.localeCompare(b.date))
+
+  const credits = custLedger
+    .filter((l) => l.direction === 'CREDIT')
+    .map((l) => ({ date: l.createdAt, remaining: l.amount }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+
+  const bills = debits.map((d) => {
+    let remainingDue = d.total
+    let clearedAt: string | undefined
+
+    for (const credit of credits) {
+      if (remainingDue <= 0) break
+      if (credit.remaining <= 0) continue
+
+      const applied = Math.min(remainingDue, credit.remaining)
+      remainingDue -= applied
+      credit.remaining -= applied
+
+      if (remainingDue <= 0) {
+        clearedAt = credit.date
+      }
+    }
+
+    const amountPaid = d.total - remainingDue
+
+    const status: CustomerBill['status'] =
+      remainingDue <= 0
+        ? 'PAID'
+        : amountPaid > 0
+          ? 'PARTIAL'
+          : 'DUE'
+
+    const items: BillItemLine[] = d.sale
+      ? d.sale.items.map((it) => ({
+          productId: it.productId,
+          name: productName(it.productId),
+          quantity: it.quantity,
+          price: it.price,
+          lineTotal: it.price * it.quantity,
+        }))
+      : []
+
+    return {
+      id: d.id,
+      date: d.date,
+      label: d.label,
+      items,
+      subtotal: d.sale?.subtotal,
+      discount: d.sale?.discount,
+      total: d.total,
+      amountPaid,
+      amountDue: remainingDue,
+      status,
+      clearedAt,
+    }
+  })
+
+  // Most recent bill first.
+  return bills.sort((a, b) => b.date.localeCompare(a.date))
+}
 
 /* =========================================================
    REUSABLE UI
@@ -360,6 +502,7 @@ function Shop({ session }: { session: Session }) {
     // =========================
     // PRODUCTS
     // =========================
+    // Format: [name, sku, unit, purchasePrice, mrpSellingPrice, minimumStock, currentStock]
     const productData = [
       ['Tata Salt 1kg', 'SALT001', 'packet', 22, 28, 10, 42],
       ['Aashirvaad Atta 5kg', 'ATTA001', 'bag', 250, 285, 8, 18],
@@ -373,6 +516,18 @@ function Shop({ session }: { session: Session }) {
       ['Britannia Good Day', 'BRIT001', 'packet', 25, 30, 8, 16],
       ['Dairy Milk 40g', 'DAIRY001', 'bar', 30, 40, 8, 19],
       ['Colgate 200g', 'COLGATE001', 'tube', 85, 105, 5, 11],
+      ['Tata Tea Premium 250g', 'TEA001', 'packet', 135, 155, 8, 14],
+      ['Bru Instant Coffee 100g', 'COFFEE001', 'jar', 148, 165, 6, 9],
+      ['Toor Dal 1kg', 'DAL001', 'packet', 118, 132, 10, 20],
+      ['Basmati Rice 5kg', 'RICE001', 'bag', 390, 430, 8, 10],
+      ['Sugar 1kg', 'SUGAR001', 'packet', 42, 48, 12, 26],
+      ['Saffola Oats 1kg', 'OATS001', 'packet', 165, 189, 6, 8],
+      ['Kissan Tomato Ketchup 500g', 'KETCHUP001', 'bottle', 105, 120, 6, 13],
+      ['Haldiram Bhujia 400g', 'BHUJIA001', 'packet', 92, 110, 8, 15],
+      ['Dettol Handwash 200ml', 'DETTOL001', 'bottle', 72, 85, 8, 12],
+      ['Vim Dishwash Bar 300g', 'VIM001', 'bar', 20, 25, 10, 28],
+      ['Nestle Everyday Milk Powder 400g', 'POWDER001', 'packet', 198, 225, 6, 9],
+      ['Maaza 600ml', 'MAAZA001', 'bottle', 34, 40, 8, 17],
     ]
 
     const products: Product[] = productData.map(
@@ -541,6 +696,55 @@ function Shop({ session }: { session: Session }) {
     }
 
     await localDb.ledgerTransactions.put(ledgerEntry)
+
+    // =========================
+    // DEMO PENDING DELIVERY ORDERS
+    // =========================
+    const deliveryOrder1: Sale = makeSale(
+      0,
+      5,
+      customers[0].customerId,
+    )
+    deliveryOrder1.paymentStatus = 'PENDING'
+    deliveryOrder1.paymentMethod = 'CREDIT'
+
+    const deliveryOrder2: Sale = makeSale(
+      1,
+      2,
+      customers[1].customerId,
+    )
+    deliveryOrder2.paymentStatus = 'PENDING'
+    deliveryOrder2.paymentMethod = 'UPI'
+
+    const deliveryOrder3: Sale = makeSale(
+      3,
+      8,
+      customers[2].customerId,
+    )
+    deliveryOrder3.paymentStatus = 'PENDING'
+    deliveryOrder3.paymentMethod = 'CREDIT'
+
+    const deliveryOrder4: Sale = makeSale(
+      4,
+      1,
+      customers[3].customerId,
+    )
+    deliveryOrder4.paymentStatus = 'PENDING'
+    deliveryOrder4.paymentMethod = 'UPI'
+
+    await localDb.sales.bulkPut([
+      deliveryOrder1,
+      deliveryOrder2,
+      deliveryOrder3,
+      deliveryOrder4,
+    ])
+
+    await localDb.saleItems.bulkPut([
+      ...deliveryOrder1.items,
+      ...deliveryOrder2.items,
+      ...deliveryOrder3.items,
+      ...deliveryOrder4.items,
+    ] as SaleItem[])
 
     console.log('DukaanSaathi: offline demo data seeded successfully')
   }
@@ -749,6 +953,8 @@ function Dashboard({
 }) {
   const [sales, setSales] = useState<Sale[]>([])
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
+  const [saleItems, setSaleItems] = useState<SaleItem[]>([])
+  const [showSalesView, setShowSalesView] = useState(false)
 
   useEffect(() => {
     void localDb.sales
@@ -762,6 +968,10 @@ function Dashboard({
       .equals(session.shopId)
       .toArray()
       .then(setLedger)
+
+    void localDb.saleItems
+      .toArray()
+      .then(setSaleItems)
   }, [session.shopId, products, customers])
 
   const outstanding = customers.reduce(
@@ -1077,6 +1287,157 @@ function Dashboard({
 
       </div>
 
+      {/* SALES VIEW */}
+      {showSalesView && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-bold text-slate-950">
+              All Sales & Payments
+            </h2>
+
+            <button
+              onClick={() => setShowSalesView(false)}
+              className="rounded-lg border border-slate-200 bg-white px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              Close
+            </button>
+          </div>
+
+          {sales.length === 0 ? (
+            <Card>
+              <p className="text-center text-slate-500">
+                No sales recorded yet.
+              </p>
+            </Card>
+          ) : (
+            <div className="grid gap-4">
+              {sales.map((sale) => {
+                const customer = customers.find(
+                  (c) => c.customerId === sale.customerId,
+                )
+                const items = saleItems.filter(
+                  (i) => i.saleId === sale.saleId,
+                )
+
+                return (
+                  <Card key={sale.saleId}>
+                    <div className="flex items-start justify-between">
+                      <div>
+                        {customer && (
+                          <>
+                            <h3 className="font-bold">
+                              {customer.name}
+                            </h3>
+
+                            <p className="text-sm text-slate-500">
+                              {customer.phone}
+                            </p>
+                          </>
+                        )}
+
+                        <p className="mt-2 text-xs text-slate-400">
+                          {new Date(
+                            sale.createdAt,
+                          ).toLocaleDateString('en-IN')}{' '}
+                          at{' '}
+                          {new Date(
+                            sale.createdAt,
+                          ).toLocaleTimeString('en-IN', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </p>
+                      </div>
+
+                      <div className="text-right">
+                        <span
+                          className={`rounded-lg px-3 py-1 text-xs font-semibold ${
+                            sale.paymentStatus ===
+                            'SUCCESS'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : sale.paymentStatus ===
+                                  'PENDING'
+                                ? 'bg-yellow-100 text-yellow-800'
+                                : 'bg-red-100 text-red-800'
+                          }`}
+                        >
+                          {sale.paymentStatus}
+                        </span>
+
+                        <p className="mt-2 text-sm font-semibold">
+                          {sale.paymentMethod}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="my-4 border-t border-slate-100 pt-4">
+                      <div className="space-y-2">
+                        {items.map((item) => {
+                          const product = products.find(
+                            (p) =>
+                              p.productId ===
+                              item.productId,
+                          )
+
+                          return (
+                            <div
+                              key={item.saleItemId}
+                              className="flex justify-between text-sm"
+                            >
+                              <span>
+                                {product?.name || 'Unknown'} (
+                                {item.quantity})
+                              </span>
+
+                              <span className="font-medium">
+                                {money(
+                                  item.quantity *
+                                    item.price,
+                                )}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="flex justify-between border-t border-slate-100 pt-4 text-lg font-bold">
+                      <span>Total</span>
+
+                      <span>{money(sale.total)}</span>
+                    </div>
+                  </Card>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* QUICK ACCESS TO SALES */}
+      {!showSalesView && (
+        <Card>
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="font-bold text-slate-950">
+                Today's Transactions
+              </h3>
+
+              <p className="mt-1 text-sm text-slate-500">
+                {sales.length} sales recorded
+              </p>
+            </div>
+
+            <button
+              onClick={() => setShowSalesView(true)}
+              className="rounded-lg bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-500"
+            >
+              View All Sales
+            </button>
+          </div>
+        </Card>
+      )}
+
     </div>
   )
 }
@@ -1272,14 +1633,32 @@ function Inventory({
 function Khata({
   session,
   customers,
+  products,
   refresh,
 }: Ctx) {
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [givenAmount, setGivenAmount] = useState('')
+  const [givenDateTime, setGivenDateTime] = useState('')
   const [selected, setSelected] = useState('')
   const [amount, setAmount] = useState('')
+  const [paymentDateTime, setPaymentDateTime] = useState('')
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
+  const [sales, setSales] = useState<Sale[]>([])
+  const [historyCustomerId, setHistoryCustomerId] = useState<
+    string | null
+  >(null)
+
+  // Converts a <input type="datetime-local"> value into an ISO timestamp.
+  // Falls back to the current time when the field is left blank.
+  const toIsoOrNow = (value: string) => {
+    if (!value) return now()
+
+    const parsed = new Date(value)
+    if (Number.isNaN(parsed.getTime())) return now()
+
+    return parsed.toISOString()
+  }
 
   const loadLedger = async () => {
     setLedger(
@@ -1290,15 +1669,25 @@ function Khata({
     )
   }
 
+  const loadSales = async () => {
+    setSales(
+      await localDb.sales
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+  }
+
   useEffect(() => {
     void loadLedger()
+    void loadSales()
   }, [session.shopId, customers])
 
   const add = async (e: FormEvent) => {
     e.preventDefault()
 
     const openingAmount = Math.max(0, Number(givenAmount) || 0)
-    const time = now()
+    const time = toIsoOrNow(givenDateTime)
     const customerId = id()
     const transactionId = id()
 
@@ -1335,11 +1724,58 @@ function Khata({
     setName('')
     setPhone('')
     setGivenAmount('')
+    setGivenDateTime('')
 
     await refresh()
     await loadLedger()
 
     setSelected(customerId)
+  }
+
+  const deleteCustomerRecords = async (customer: Customer) => {
+    const confirmed = window.confirm(
+      `Delete ${customer.name}'s customer record?`,
+    )
+
+    if (!confirmed) return
+
+    const confirmedAgain = window.confirm(
+      `This will permanently delete ${customer.name}'s record and transaction history. Continue?`,
+    )
+
+    if (!confirmedAgain) return
+
+    await localDb.transaction(
+      'rw',
+      localDb.customers,
+      localDb.ledgerTransactions,
+      async () => {
+        await localDb.customers
+          .where('id')
+          .equals(customer.id)
+          .delete()
+
+        await localDb.ledgerTransactions
+          .where('shopId')
+          .equals(session.shopId)
+          .filter((transaction) =>
+            transaction.customerId === customer.customerId,
+          )
+          .delete()
+      },
+    )
+
+    if (selected === customer.customerId) {
+      setSelected('')
+    }
+
+    if (historyCustomerId === customer.customerId) {
+      setHistoryCustomerId(null)
+    }
+
+    await refresh()
+    await loadLedger()
+    await loadSales()
   }
 
   // Positive balance = customer still has to pay us
@@ -1358,28 +1794,98 @@ function Khata({
     (c) => c.customerId === selected,
   )
 
+  const historyCustomer = customers.find(
+    (c) => c.customerId === historyCustomerId,
+  )
+
+  const historyBills = historyCustomer
+    ? buildCustomerBills(historyCustomer, sales, ledger, products)
+    : []
+
   const [customerSort, setCustomerSort] = useState<
     | 'default'
     | 'dueDesc'
     | 'dueAsc'
     | 'advanceDesc'
     | 'advanceAsc'
+    | 'daysDesc'
+    | 'daysAsc'
   >('default')
 
-  // Due (credit given) = positive balance, Advance = negative balance.
+  const PENDING_FILTER_OPTIONS = [
+    500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000,
+    9000, 10000,
+  ] as const
+
+  const [pendingFilter, setPendingFilter] = useState<
+    'all' | (typeof PENDING_FILTER_OPTIONS)[number]
+  >('all')
+
+  // Pending due = positive balance (customer owes us), Advance = negative balance (we owe customer / customer overpaid).
   const dueAmount = (balance: number) =>
     balance > 0 ? balance : 0
 
   const advanceAmount = (balance: number) =>
     balance < 0 ? Math.abs(balance) : 0
 
-  const sortedCustomers = useMemo(() => {
-    if (customerSort === 'default') return customers
+  // Earliest date this customer started owing money that is still unpaid,
+  // based on the opening balance and any DEBIT (credit given) ledger entries.
+  const oldestDueTimestamp = (c: Customer) => {
+    const timestamps: number[] = []
 
-    const withBalance = customers.map((c) => ({
-      customer: c,
-      balance: balanceFor(c),
-    }))
+    if (c.openingBalance > 0) {
+      timestamps.push(new Date(c.createdAt).getTime())
+    }
+
+    ledger
+      .filter(
+        (l) =>
+          l.customerId === c.customerId &&
+          l.direction === 'DEBIT',
+      )
+      .forEach((l) =>
+        timestamps.push(new Date(l.createdAt).getTime()),
+      )
+
+    if (timestamps.length === 0) return null
+
+    return Math.min(...timestamps)
+  }
+
+  // Number of days a customer's current due has been outstanding.
+  // Customers with no due are treated as 0 days.
+  const daysPending = (c: Customer, balance: number) => {
+    if (balance <= 0) return 0
+
+    const oldest = oldestDueTimestamp(c)
+    if (oldest === null) return 0
+
+    const diffMs = Date.now() - oldest
+    return Math.max(
+      0,
+      Math.floor(diffMs / (1000 * 60 * 60 * 24)),
+    )
+  }
+
+  const sortedCustomers = useMemo(() => {
+    const filtered =
+      pendingFilter === 'all'
+        ? customers
+        : customers.filter(
+            (c) => dueAmount(balanceFor(c)) > pendingFilter,
+          )
+
+    if (customerSort === 'default') return filtered
+
+    const withBalance = filtered.map((c) => {
+      const balance = balanceFor(c)
+
+      return {
+        customer: c,
+        balance,
+        days: daysPending(c, balance),
+      }
+    })
 
     withBalance.sort((a, b) => {
       switch (customerSort) {
@@ -1401,6 +1907,10 @@ function Khata({
             advanceAmount(a.balance) -
             advanceAmount(b.balance)
           )
+        case 'daysDesc':
+          return b.days - a.days
+        case 'daysAsc':
+          return a.days - b.days
         default:
           return 0
       }
@@ -1408,7 +1918,7 @@ function Khata({
 
     return withBalance.map((w) => w.customer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [customers, ledger, customerSort])
+  }, [customers, ledger, customerSort, pendingFilter])
 
   const pay = async () => {
     if (!selectedCustomer) {
@@ -1453,7 +1963,7 @@ function Khata({
       }
     }
 
-    const time = now()
+    const time = toIsoOrNow(paymentDateTime)
     const transactionId = id()
 
     const payment: Payment = {
@@ -1505,6 +2015,7 @@ function Khata({
     )
 
     setAmount('')
+    setPaymentDateTime('')
     await refresh()
     await loadLedger()
   }
@@ -1578,7 +2089,7 @@ function Khata({
 
         <form
           onSubmit={add}
-          className="grid gap-3 md:grid-cols-4"
+          className="grid gap-3 md:grid-cols-5"
         >
           <Input
             placeholder="Customer name"
@@ -1606,6 +2117,20 @@ function Khata({
             required
           />
 
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-slate-500">
+              Date &amp; time (optional)
+            </label>
+
+            <Input
+              type="datetime-local"
+              value={givenDateTime}
+              onChange={(e) =>
+                setGivenDateTime(e.target.value)
+              }
+            />
+          </div>
+
           <PrimaryButton>
             + Add customer
           </PrimaryButton>
@@ -1616,34 +2141,66 @@ function Khata({
         {/* CUSTOMER LIST */}
         <div className="space-y-3">
           {customers.length > 0 && (
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="font-bold text-slate-950">
                 Customers
               </h2>
 
-              <select
-                value={customerSort}
-                onChange={(e) =>
-                  setCustomerSort(
-                    e.target.value as typeof customerSort,
-                  )
-                }
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
-              >
-                <option value="default">Sort by</option>
-                <option value="dueDesc">
-                  Credit given: High to Low
-                </option>
-                <option value="dueAsc">
-                  Credit given: Low to High
-                </option>
-                <option value="advanceDesc">
-                  Advance received: High to Low
-                </option>
-                <option value="advanceAsc">
-                  Advance received: Low to High
-                </option>
-              </select>
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={pendingFilter}
+                  onChange={(e) =>
+                    setPendingFilter(
+                      (e.target.value === 'all'
+                        ? 'all'
+                        : Number(
+                            e.target.value,
+                          )) as typeof pendingFilter,
+                    )
+                  }
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
+                >
+                  <option value="all">
+                    Filter: All customers
+                  </option>
+
+                  {PENDING_FILTER_OPTIONS.map((amt) => (
+                    <option key={amt} value={amt}>
+                      Pending above {money(amt)}
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  value={customerSort}
+                  onChange={(e) =>
+                    setCustomerSort(
+                      e.target.value as typeof customerSort,
+                    )
+                  }
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
+                >
+                  <option value="default">Sort by</option>
+                  <option value="dueDesc">
+                    Pending due: High to Low
+                  </option>
+                  <option value="dueAsc">
+                    Pending due: Low to High
+                  </option>
+                  <option value="advanceDesc">
+                    Advance received: High to Low
+                  </option>
+                  <option value="advanceAsc">
+                    Advance received: Low to High
+                  </option>
+                  <option value="daysDesc">
+                    Pending since: Max days to Min days
+                  </option>
+                  <option value="daysAsc">
+                    Pending since: Min days to Max days
+                  </option>
+                </select>
+              </div>
             </div>
           )}
 
@@ -1652,6 +2209,12 @@ function Khata({
               icon="📒"
               title="No customers yet"
               text="Add a customer above to start using Khata."
+            />
+          ) : sortedCustomers.length === 0 ? (
+            <EmptyState
+              icon="🔍"
+              title="No customers match this filter"
+              text="Try a lower pending amount or clear the filter."
             />
           ) : (
             sortedCustomers.map((c) => {
@@ -1670,6 +2233,7 @@ function Khata({
 
               const hasDue = balance > 0
               const hasAdvance = balance < 0
+              const pendingDays = daysPending(c, balance)
 
               return (
                 <button
@@ -1686,9 +2250,16 @@ function Khata({
                 >
                   <div className="flex items-center justify-between gap-4">
                     <div>
-                      <b className="text-base">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setHistoryCustomerId(c.customerId)
+                        }}
+                        className="text-base font-bold text-slate-950 underline decoration-dotted decoration-slate-300 underline-offset-4 transition hover:text-emerald-700 hover:decoration-emerald-400"
+                      >
                         {c.name}
-                      </b>
+                      </button>
 
                       <p className="mt-1 text-sm text-slate-500">
                         {c.phone}
@@ -1707,6 +2278,17 @@ function Khata({
                     </div>
 
                     <div className="text-right">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void deleteCustomerRecords(c)
+                        }}
+                        className="mb-3 rounded-lg border border-rose-200 px-2.5 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-50"
+                      >
+                        Delete
+                      </button>
+
                       {hasDue ? (
                         <>
                           <p className="text-xs text-slate-400">
@@ -1715,6 +2297,15 @@ function Khata({
 
                           <p className="text-xl font-bold text-amber-700">
                             {money(balance)}
+                          </p>
+
+                          <p className="mt-1 text-xs font-semibold text-amber-600">
+                            Pending{' '}
+                            {pendingDays === 0
+                              ? 'since today'
+                              : pendingDays === 1
+                                ? 'for 1 day'
+                                : `for ${pendingDays} days`}
                           </p>
                         </>
                       ) : hasAdvance ? (
@@ -1853,24 +2444,29 @@ function Khata({
             onChange={(e) =>
               setAmount(e.target.value)
             }
-            disabled={
-              !selectedCustomer ||
-              balanceFor(
-                selectedCustomer as Customer,
-              ) <= 0
-            }
+            disabled={!selectedCustomer}
           />
+
+          <div className="mt-3">
+            <label className="mb-1 block text-xs font-semibold text-slate-500">
+              Date &amp; time (optional)
+            </label>
+
+            <Input
+              type="datetime-local"
+              value={paymentDateTime}
+              onChange={(e) =>
+                setPaymentDateTime(e.target.value)
+              }
+              disabled={!selectedCustomer}
+            />
+          </div>
 
           <PrimaryButton
             type="button"
             className="mt-3 w-full"
             onClick={pay}
-            disabled={
-              !selectedCustomer ||
-              balanceFor(
-                selectedCustomer as Customer,
-              ) <= 0
-            }
+            disabled={!selectedCustomer}
           >
             Save cash payment
           </PrimaryButton>
@@ -1997,6 +2593,200 @@ function Khata({
           )}
         </Card>
       </div>
+
+      {historyCustomer && (
+        <CustomerHistoryModal
+          customer={historyCustomer}
+          bills={historyBills}
+          onClose={() => setHistoryCustomerId(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+/* =========================================================
+   CUSTOMER HISTORY MODAL
+========================================================= */
+
+function CustomerHistoryModal({
+  customer,
+  bills,
+  onClose,
+}: {
+  customer: Customer
+  bills: CustomerBill[]
+  onClose: () => void
+}) {
+  const totalDue = bills.reduce((n, b) => n + b.amountDue, 0)
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/50 p-4 pt-10 backdrop-blur-sm"
+      role="presentation"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose()
+      }}
+    >
+      <div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-5">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Purchase history
+            </p>
+
+            <h2 className="mt-1 text-lg font-bold text-slate-950">
+              {customer.name}
+            </h2>
+
+            <p className="mt-1 text-sm text-slate-500">
+              {customer.phone}
+            </p>
+
+            <p className="mt-2 text-sm font-semibold text-amber-700">
+              {totalDue > 0
+                ? `Total due: ${money(totalDue)}`
+                : 'No amount due'}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-slate-200 text-slate-500 transition hover:bg-slate-50"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="max-h-[70vh] space-y-3 overflow-y-auto p-5">
+          {bills.length === 0 ? (
+            <div className="rounded-xl bg-slate-50 p-6 text-center text-sm text-slate-500">
+              No purchase records yet for this customer.
+            </div>
+          ) : (
+            bills.map((bill) => (
+              <div
+                key={bill.id}
+                className="rounded-2xl border border-slate-200 p-4"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-bold text-slate-900">
+                      {bill.label}
+                    </p>
+
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      {new Date(bill.date).toLocaleString(
+                        'en-IN',
+                        {
+                          day: '2-digit',
+                          month: 'short',
+                          year: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        },
+                      )}
+                    </p>
+                  </div>
+
+                  <span
+                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                      bill.status === 'PAID'
+                        ? 'bg-emerald-50 text-emerald-700'
+                        : bill.status === 'PARTIAL'
+                          ? 'bg-amber-50 text-amber-700'
+                          : 'bg-rose-50 text-rose-700'
+                    }`}
+                  >
+                    {bill.status === 'PAID'
+                      ? 'Cleared'
+                      : bill.status === 'PARTIAL'
+                        ? 'Partially paid'
+                        : 'Due'}
+                  </span>
+                </div>
+
+                {bill.items.length > 0 && (
+                  <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-3">
+                    {bill.items.map((item, idx) => (
+                      <div
+                        className="flex items-center justify-between text-sm"
+                        key={`${bill.id}-${item.productId}-${idx}`}
+                      >
+                        <span className="text-slate-600">
+                          {item.name}{' '}
+                          <span className="text-slate-400">
+                            × {item.quantity} @{' '}
+                            {money(item.price)}
+                          </span>
+                        </span>
+
+                        <span className="font-medium text-slate-800">
+                          {money(item.lineTotal)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="mt-3 space-y-1 border-t border-slate-100 pt-3 text-sm">
+                  {bill.subtotal !== undefined && (
+                    <div className="flex justify-between text-slate-500">
+                      <span>Subtotal</span>
+                      <span>{money(bill.subtotal)}</span>
+                    </div>
+                  )}
+
+                  {!!bill.discount && (
+                    <div className="flex justify-between text-slate-500">
+                      <span>Discount</span>
+                      <span>
+                        − {money(bill.discount)}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="flex justify-between font-bold text-slate-900">
+                    <span>Total bill</span>
+                    <span>{money(bill.total)}</span>
+                  </div>
+
+                  {bill.amountPaid > 0 && (
+                    <div className="flex justify-between text-emerald-700">
+                      <span>Paid</span>
+                      <span>{money(bill.amountPaid)}</span>
+                    </div>
+                  )}
+
+                  {bill.amountDue > 0 && (
+                    <div className="flex justify-between font-semibold text-amber-700">
+                      <span>Due</span>
+                      <span>{money(bill.amountDue)}</span>
+                    </div>
+                  )}
+
+                  {bill.status === 'PAID' && bill.clearedAt && (
+                    <div className="flex justify-between text-xs text-slate-400">
+                      <span>Cleared on</span>
+                      <span>
+                        {new Date(
+                          bill.clearedAt,
+                        ).toLocaleDateString('en-IN', {
+                          day: '2-digit',
+                          month: 'short',
+                          year: 'numeric',
+                        })}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -2016,6 +2806,51 @@ function Pos({
   const [method, setMethod] =
     useState<'CASH' | 'CREDIT' | 'UPI'>('CASH')
   const [showUpi, setShowUpi] = useState(false)
+  const [view, setView] = useState<'billing' | 'deliveries'>('billing')
+  const [pendingSales, setPendingSales] = useState<Sale[]>([])
+  const [saleItems, setSaleItems] = useState<SaleItem[]>([])
+  const [paymentDialog, setPaymentDialog] = useState<{
+    saleId: string
+    sale: Sale
+  } | null>(null)
+  const [paymentStatus, setPaymentStatus] =
+    useState<'PAID' | 'PARTIAL' | 'NOT_PAID'>('NOT_PAID')
+  const [amountPaid, setAmountPaid] = useState('')
+
+  const loadPendingSales = async () => {
+    const sales = await localDb.sales
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+
+    // Get all khata entries to see which orders have been marked as delivered
+    const allLedger = await localDb.ledgerTransactions
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+
+    const deliveredOrderIds = new Set(
+      allLedger
+        .filter((l) => l.description?.includes('Delivery order'))
+        .map((l) => l.referenceId),
+    )
+
+    const pending = sales.filter(
+      (s) =>
+        (s.paymentStatus === 'PENDING' ||
+          s.paymentStatus === 'FAILED') &&
+        s.customerId &&
+        !deliveredOrderIds.has(s.saleId), // Exclude orders already marked as delivered
+    )
+    setPendingSales(pending)
+
+    const allItems = await localDb.saleItems.toArray()
+    setSaleItems(allItems)
+  }
+
+  useEffect(() => {
+    void loadPendingSales()
+  }, [session.shopId])
 
   const total = useMemo(
     () =>
@@ -2172,16 +3007,313 @@ function Pos({
     alert(`Receipt saved locally: ${money(total)}`)
   }
 
+  const handlePaymentConfirm = async () => {
+    if (!paymentDialog) return
+
+    const { saleId, sale } = paymentDialog
+    const time = now()
+    let newPaymentStatus: PaymentStatus = 'SUCCESS'
+    let amountOwed = 0
+
+    if (paymentStatus === 'NOT_PAID') {
+      newPaymentStatus = 'PENDING'
+      amountOwed = sale.total
+    } else if (paymentStatus === 'PARTIAL') {
+      newPaymentStatus = 'PENDING'
+      const paid = parseFloat(amountPaid) || 0
+      amountOwed = Math.max(0, sale.total - paid)
+    } else {
+      newPaymentStatus = 'SUCCESS'
+      amountOwed = 0
+    }
+
+    // Update sale with new payment status
+    await localDb.sales.put({
+      ...sale,
+      paymentStatus: newPaymentStatus,
+      updatedAt: time,
+    })
+
+    // If customer and amount owed, add/update khata
+    if (sale.customerId && amountOwed > 0) {
+      // Get customer's existing balance from other ledger entries
+      const existingEntries =
+        await localDb.ledgerTransactions
+          .where('customerId')
+          .equals(sale.customerId)
+          .toArray()
+
+      // Calculate total outstanding balance
+      let totalBalance = 0
+      for (const entry of existingEntries) {
+        if (entry.direction === 'DEBIT') {
+          totalBalance += entry.amount
+        } else if (entry.direction === 'CREDIT') {
+          totalBalance -= entry.amount
+        }
+      }
+
+      // Add this sale's outstanding amount
+      const newBalance = totalBalance + amountOwed
+
+      // Check if khata entry already exists for this sale
+      const existingEntry =
+        await localDb.ledgerTransactions
+          .where('referenceId')
+          .equals(saleId)
+          .first()
+
+      if (!existingEntry) {
+        await localDb.ledgerTransactions.put({
+          id: id(),
+          shopId: session.shopId,
+          transactionId: `${sale.transactionId}:khata`,
+          customerId: sale.customerId,
+          type: 'SALE',
+          direction: 'DEBIT',
+          amount: amountOwed,
+          referenceId: saleId,
+          description:
+            paymentStatus === 'PARTIAL'
+              ? `Delivery order - partial payment (${money(parseFloat(amountPaid) || 0)} paid)`
+              : 'Delivery order - unpaid',
+          createdAt: time,
+          updatedAt: time,
+        })
+      }
+    } else if (sale.customerId && newPaymentStatus === 'SUCCESS') {
+      // For paid orders, also create a delivery entry to mark as processed
+      const existingEntry =
+        await localDb.ledgerTransactions
+          .where('referenceId')
+          .equals(saleId)
+          .first()
+
+      if (!existingEntry) {
+        await localDb.ledgerTransactions.put({
+          id: id(),
+          shopId: session.shopId,
+          transactionId: `${sale.transactionId}:delivery`,
+          customerId: sale.customerId,
+          type: 'SALE',
+          direction: 'CREDIT',
+          amount: 0,
+          referenceId: saleId,
+          description: 'Delivery order - paid',
+          createdAt: time,
+          updatedAt: time,
+        })
+      }
+    }
+
+    // Enqueue for sync
+    await enqueue({
+      transactionId: sale.transactionId,
+      entityId: saleId,
+      action: 'UPDATE',
+      endpoint: '/api/sales',
+      method: 'PUT',
+      payload: { ...sale, paymentStatus: newPaymentStatus },
+    })
+
+    setPaymentDialog(null)
+    setPaymentStatus('NOT_PAID')
+    setAmountPaid('')
+
+    // First, remove from state immediately for UI responsiveness
+    setPendingSales((prev) =>
+      prev.filter((s) => s.saleId !== saleId),
+    )
+
+    // Reload from the database using the same delivered-order filter.
+    await refresh()
+    await loadPendingSales()
+
+    const statusMsg =
+      newPaymentStatus === 'SUCCESS'
+        ? 'Order marked as paid'
+        : amountOwed > 0
+          ? `Order marked with ${money(amountOwed)} pending - added to khata`
+          : 'Order marked as delivered'
+
+    alert(statusMsg)
+  }
+
+  const openPaymentDialog = (sale: Sale) => {
+    setPaymentDialog({ saleId: sale.saleId, sale })
+    setPaymentStatus('NOT_PAID')
+    setAmountPaid('')
+  }
+
+  const markAsDelivered = async (saleId: string) => {
+    const sale = pendingSales.find((s) => s.saleId === saleId)
+    if (!sale) return
+
+    openPaymentDialog(sale)
+  }
+
   return (
     <div className="space-y-5">
+
+      {/* PAYMENT STATUS DIALOG */}
+      {paymentDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+          <Card className="w-full max-w-md">
+            <div>
+              <h3 className="text-lg font-bold">
+                Payment Status
+              </h3>
+
+              <p className="mt-2 text-sm text-slate-500">
+                Order Total: <span className="font-bold">{money(paymentDialog.sale.total)}</span>
+              </p>
+            </div>
+
+            <div className="my-5 space-y-3">
+              <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
+                onClick={() => setPaymentStatus('PAID')}
+              >
+                <input
+                  type="radio"
+                  checked={paymentStatus === 'PAID'}
+                  onChange={() => setPaymentStatus('PAID')}
+                  className="cursor-pointer"
+                />
+                <div>
+                  <p className="font-semibold">Paid in Full</p>
+                  <p className="text-xs text-slate-500">
+                    No entry in khata
+                  </p>
+                </div>
+              </label>
+
+              <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
+                onClick={() => setPaymentStatus('PARTIAL')}
+              >
+                <input
+                  type="radio"
+                  checked={paymentStatus === 'PARTIAL'}
+                  onChange={() => setPaymentStatus('PARTIAL')}
+                  className="cursor-pointer"
+                />
+                <div>
+                  <p className="font-semibold">Partial Payment</p>
+                  <p className="text-xs text-slate-500">
+                    Enter amount paid
+                  </p>
+                </div>
+              </label>
+
+              <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
+                onClick={() => setPaymentStatus('NOT_PAID')}
+              >
+                <input
+                  type="radio"
+                  checked={paymentStatus === 'NOT_PAID'}
+                  onChange={() => setPaymentStatus('NOT_PAID')}
+                  className="cursor-pointer"
+                />
+                <div>
+                  <p className="font-semibold">Not Paid</p>
+                  <p className="text-xs text-slate-500">
+                    Full amount to khata
+                  </p>
+                </div>
+              </label>
+            </div>
+
+            {paymentStatus === 'PARTIAL' && (
+              <div className="mb-4">
+                <label className="block text-sm font-semibold text-slate-700">
+                  Amount Paid
+                </label>
+
+                <input
+                  type="number"
+                  value={amountPaid}
+                  onChange={(e) =>
+                    setAmountPaid(e.target.value)
+                  }
+                  placeholder="0"
+                  className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2"
+                />
+
+                {amountPaid && (
+                  <p className="mt-2 text-sm text-slate-600">
+                    Remaining:{' '}
+                    <span className="font-bold">
+                      {money(
+                        Math.max(
+                          0,
+                          paymentDialog.sale.total -
+                            (parseFloat(amountPaid) || 0),
+                        ),
+                      )}
+                    </span>
+                  </p>
+                )}
+              </div>
+            )}
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => {
+                  setPaymentDialog(null)
+                  setPaymentStatus('NOT_PAID')
+                  setAmountPaid('')
+                }}
+                className="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+
+              <PrimaryButton
+                className="flex-1"
+                onClick={handlePaymentConfirm}
+              >
+                Confirm
+              </PrimaryButton>
+            </div>
+          </Card>
+        </div>
+      )}
 
       <PageHeader
         eyebrow="POINT OF SALE"
         title="Point of sale"
-        description="Build a bill and complete a sale quickly."
+        description={
+          view === 'billing'
+            ? 'Build a bill and complete a sale quickly.'
+            : 'Manage pending deliveries and payments.'
+        }
       />
 
-      <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
+      <div className="mb-4 flex gap-2 border-b border-slate-200">
+        <button
+          onClick={() => setView('billing')}
+          className={`px-4 py-2 font-semibold transition ${
+            view === 'billing'
+              ? 'border-b-2 border-emerald-600 text-emerald-600'
+              : 'text-slate-500'
+          }`}
+        >
+          New Sale
+        </button>
+
+        <button
+          onClick={() => setView('deliveries')}
+          className={`px-4 py-2 font-semibold transition ${
+            view === 'deliveries'
+              ? 'border-b-2 border-emerald-600 text-emerald-600'
+              : 'text-slate-500'
+          }`}
+        >
+          Pending Deliveries ({pendingSales.length})
+        </button>
+      </div>
+
+      {view === 'billing' && (
+        <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
 
         {/* PRODUCTS */}
         <div>
@@ -2423,6 +3555,140 @@ function Pos({
         </Card>
 
       </div>
+      )}
+
+      {view === 'deliveries' && (
+        <div className="space-y-4">
+          {pendingSales.length === 0 ? (
+            <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center">
+              <p className="text-slate-500">
+                No pending deliveries
+              </p>
+            </div>
+          ) : (
+            pendingSales.map((sale) => {
+              const customer = customers.find(
+                (c) => c.customerId === sale.customerId,
+              )
+              const items = saleItems.filter(
+                (i) => i.saleId === sale.saleId,
+              )
+
+              return (
+                <Card key={sale.saleId}>
+                  <div className="mb-4 flex items-start justify-between">
+                    <div>
+                      {customer && (
+                        <>
+                          <h3 className="text-lg font-bold">
+                            {customer.name}
+                          </h3>
+
+                          <p className="text-sm text-slate-500">
+                            {customer.phone}
+                          </p>
+                        </>
+                      )}
+
+                      <p className="mt-1 text-xs text-slate-400">
+                        {new Date(
+                          sale.createdAt,
+                        ).toLocaleDateString('en-IN')}{' '}
+                        at{' '}
+                        {new Date(
+                          sale.createdAt,
+                        ).toLocaleTimeString('en-IN', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </p>
+                    </div>
+
+                    <span
+                      className={`rounded-lg px-3 py-1 text-xs font-semibold ${
+                        sale.paymentStatus === 'PENDING'
+                          ? 'bg-yellow-100 text-yellow-800'
+                          : 'bg-red-100 text-red-800'
+                      }`}
+                    >
+                      {sale.paymentStatus}
+                    </span>
+                  </div>
+
+                  <div className="my-4 border-t border-slate-100 pt-4">
+                    <h4 className="mb-3 font-semibold text-slate-700">
+                      Order Items
+                    </h4>
+
+                    <div className="space-y-2">
+                      {items.map((item) => {
+                        const product = products.find(
+                          (p) =>
+                            p.productId ===
+                            item.productId,
+                        )
+
+                        return (
+                          <div
+                            key={item.saleItemId}
+                            className="flex items-center justify-between rounded-lg bg-slate-50 p-3"
+                          >
+                            <div>
+                              <p className="font-medium">
+                                {product?.name ||
+                                  'Unknown'}
+                              </p>
+
+                              <p className="text-xs text-slate-500">
+                                Qty: {item.quantity} ×{' '}
+                                {money(item.price)}
+                              </p>
+                            </div>
+
+                            <p className="font-semibold">
+                              {money(
+                                item.quantity *
+                                  item.price,
+                              )}
+                            </p>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="my-4 border-t border-slate-100 pt-4">
+                    <div className="flex justify-between">
+                      <span className="text-slate-600">
+                        Payment Method
+                      </span>
+
+                      <span className="font-semibold">
+                        {sale.paymentMethod}
+                      </span>
+                    </div>
+
+                    <div className="mt-2 flex justify-between text-lg font-bold">
+                      <span>Total</span>
+
+                      <span>{money(sale.total)}</span>
+                    </div>
+                  </div>
+
+                  <PrimaryButton
+                    className="mt-4 w-full"
+                    onClick={() =>
+                      markAsDelivered(sale.saleId)
+                    }
+                  >
+                    Mark as Delivered
+                  </PrimaryButton>
+                </Card>
+              )
+            })
+          )}
+        </div>
+      )}
 
     </div>
   )
