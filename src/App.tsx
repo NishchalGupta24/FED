@@ -1358,58 +1358,6 @@ function Khata({
     (c) => c.customerId === selected,
   )
 
-  const [customerSort, setCustomerSort] = useState<
-    | 'default'
-    | 'dueDesc'
-    | 'dueAsc'
-    | 'advanceDesc'
-    | 'advanceAsc'
-  >('default')
-
-  // Due (credit given) = positive balance, Advance = negative balance.
-  const dueAmount = (balance: number) =>
-    balance > 0 ? balance : 0
-
-  const advanceAmount = (balance: number) =>
-    balance < 0 ? Math.abs(balance) : 0
-
-  const sortedCustomers = useMemo(() => {
-    if (customerSort === 'default') return customers
-
-    const withBalance = customers.map((c) => ({
-      customer: c,
-      balance: balanceFor(c),
-    }))
-
-    withBalance.sort((a, b) => {
-      switch (customerSort) {
-        case 'dueDesc':
-          return (
-            dueAmount(b.balance) - dueAmount(a.balance)
-          )
-        case 'dueAsc':
-          return (
-            dueAmount(a.balance) - dueAmount(b.balance)
-          )
-        case 'advanceDesc':
-          return (
-            advanceAmount(b.balance) -
-            advanceAmount(a.balance)
-          )
-        case 'advanceAsc':
-          return (
-            advanceAmount(a.balance) -
-            advanceAmount(b.balance)
-          )
-        default:
-          return 0
-      }
-    })
-
-    return withBalance.map((w) => w.customer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [customers, ledger, customerSort])
-
   const pay = async () => {
     if (!selectedCustomer) {
       alert('Choose a customer first')
@@ -1425,32 +1373,27 @@ function Khata({
 
     const due = balanceFor(selectedCustomer)
 
-    if (received > due) {
-      const advanceAmount = received - due
-
-      if (due > 0) {
+    if (due <= 0) {
+      if (due < 0) {
         alert(
-          `This clears the outstanding due of ${money(
-            due,
-          )} and records the remaining ${money(
-            advanceAmount,
-          )} as an advance from the customer.`,
-        )
-      } else if (due === 0) {
-        alert(
-          `This customer has no outstanding due. ${money(
-            advanceAmount,
-          )} will be recorded as an advance from the customer.`,
+          `This customer has already paid ${money(
+            Math.abs(due),
+          )} in advance.`,
         )
       } else {
-        alert(
-          `This adds ${money(
-            advanceAmount,
-          )} to the customer's existing advance of ${money(
-            Math.abs(due),
-          )}.`,
-        )
+        alert('This customer has no outstanding due.')
       }
+
+      return
+    }
+
+    if (received > due) {
+      alert(
+        `You can receive maximum ${money(
+          due,
+        )} because that is the current outstanding due.`,
+      )
+      return
     }
 
     const time = now()
@@ -1615,38 +1558,6 @@ function Khata({
       <div className="grid gap-5 lg:grid-cols-[1fr_420px]">
         {/* CUSTOMER LIST */}
         <div className="space-y-3">
-          {customers.length > 0 && (
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="font-bold text-slate-950">
-                Customers
-              </h2>
-
-              <select
-                value={customerSort}
-                onChange={(e) =>
-                  setCustomerSort(
-                    e.target.value as typeof customerSort,
-                  )
-                }
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
-              >
-                <option value="default">Sort by</option>
-                <option value="dueDesc">
-                  Credit given: High to Low
-                </option>
-                <option value="dueAsc">
-                  Credit given: Low to High
-                </option>
-                <option value="advanceDesc">
-                  Advance received: High to Low
-                </option>
-                <option value="advanceAsc">
-                  Advance received: Low to High
-                </option>
-              </select>
-            </div>
-          )}
-
           {customers.length === 0 ? (
             <EmptyState
               icon="📒"
@@ -1654,7 +1565,7 @@ function Khata({
               text="Add a customer above to start using Khata."
             />
           ) : (
-            sortedCustomers.map((c) => {
+            customers.map((c) => {
               const balance = balanceFor(c)
 
               const received = ledger
