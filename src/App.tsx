@@ -1276,31 +1276,39 @@ function Khata({
 }: Ctx) {
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
+  const [givenAmount, setGivenAmount] = useState('')
   const [selected, setSelected] = useState('')
   const [amount, setAmount] = useState('')
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
 
+  const loadLedger = async () => {
+    setLedger(
+      await localDb.ledgerTransactions
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+  }
+
   useEffect(() => {
-    void localDb.ledgerTransactions
-      .where('shopId')
-      .equals(session.shopId)
-      .toArray()
-      .then(setLedger)
+    void loadLedger()
   }, [session.shopId, customers])
 
   const add = async (e: FormEvent) => {
     e.preventDefault()
 
+    const openingAmount = Math.max(0, Number(givenAmount) || 0)
     const time = now()
     const customerId = id()
+    const transactionId = id()
 
     const customer: Customer = {
       id: customerId,
       customerId,
       shopId: session.shopId,
-      name,
-      phone,
-      openingBalance: 0,
+      name: name.trim(),
+      phone: phone.trim(),
+      openingBalance: openingAmount,
       interestEnabled: false,
       createdAt: time,
       updatedAt: time,
@@ -1314,7 +1322,7 @@ function Khata({
         await localDb.customers.put(customer)
 
         await enqueue({
-          transactionId: id(),
+          transactionId,
           entityId: customerId,
           action: 'CREATE',
           endpoint: '/api/customers',
@@ -1326,12 +1334,51 @@ function Khata({
 
     setName('')
     setPhone('')
+    setGivenAmount('')
 
     await refresh()
+    await loadLedger()
+    setSelected(customerId)
   }
 
+  const balanceFor = (c: Customer) =>
+    c.openingBalance +
+    ledger
+      .filter((l) => l.customerId === c.customerId)
+      .reduce(
+        (n, l) =>
+          n + (l.direction === 'DEBIT' ? l.amount : -l.amount),
+        0,
+      )
+
+  const selectedCustomer = customers.find(
+    (c) => c.customerId === selected,
+  )
+
   const pay = async () => {
-    if (!selected || +amount <= 0) return
+    if (!selectedCustomer) {
+      alert('Choose a customer first')
+      return
+    }
+
+    const received = Number(amount)
+
+    if (!Number.isFinite(received) || received <= 0) {
+      alert('Enter a valid amount received')
+      return
+    }
+
+    const due = Math.max(0, balanceFor(selectedCustomer))
+
+    if (due <= 0) {
+      alert('This customer has no outstanding due.')
+      return
+    }
+
+    if (received > due) {
+      alert(`You can receive maximum ${money(due)} for this customer.`)
+      return
+    }
 
     const time = now()
     const transactionId = id()
@@ -1340,8 +1387,8 @@ function Khata({
       id: id(),
       paymentId: id(),
       shopId: session.shopId,
-      customerId: selected,
-      amount: +amount,
+      customerId: selectedCustomer.customerId,
+      amount: received,
       status: 'SUCCESS',
       provider: 'CASH',
       transactionId,
@@ -1354,12 +1401,12 @@ function Khata({
       id: id(),
       shopId: session.shopId,
       transactionId: `${transactionId}:ledger`,
-      customerId: selected,
+      customerId: selectedCustomer.customerId,
       type: 'PAYMENT',
       direction: 'CREDIT',
-      amount: +amount,
+      amount: received,
       referenceId: payment.paymentId,
-      description: 'Cash payment',
+      description: 'Cash payment received',
       createdAt: time,
       updatedAt: time,
     }
@@ -1385,43 +1432,64 @@ function Khata({
     )
 
     setAmount('')
-
     await refresh()
-
-    setLedger(
-      await localDb.ledgerTransactions
-        .where('shopId')
-        .equals(session.shopId)
-        .toArray(),
-    )
+    await loadLedger()
   }
 
-  const bal = (c: Customer) =>
-    c.openingBalance +
-    ledger
-      .filter((l) => l.customerId === c.customerId)
-      .reduce(
-        (n, l) =>
-          n + (l.direction === 'DEBIT' ? l.amount : -l.amount),
-        0,
-      )
+  const customerHistory = selectedCustomer
+    ? [
+        ...(selectedCustomer.openingBalance > 0
+          ? [
+              {
+                id: `opening-${selectedCustomer.customerId}`,
+                createdAt: selectedCustomer.createdAt,
+                description: 'Amount given',
+                direction: 'DEBIT' as const,
+                amount: selectedCustomer.openingBalance,
+              },
+            ]
+          : []),
+        ...ledger
+          .filter((l) => l.customerId === selectedCustomer.customerId)
+          .map((l) => ({
+            id: l.id,
+            createdAt: l.createdAt,
+            description: l.description,
+            direction: l.direction,
+            amount: l.amount,
+          })),
+      ].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    : []
+
+  let runningDue = 0
+
+  const historyWithDue = customerHistory.map((item) => {
+    runningDue +=
+      item.direction === 'DEBIT' ? item.amount : -item.amount
+
+    return {
+      ...item,
+      due: Math.max(0, runningDue),
+    }
+  })
 
   return (
     <div className="space-y-5">
-
       <PageHeader
         eyebrow="CUSTOMER CREDIT"
         title="Khata"
-        description="Track customers, credit balances and payments."
+        description="Track customers, credit given, payments received and complete transaction history."
       />
 
       <Card>
+        <div className="mb-4">
+          <h2 className="font-bold text-slate-950">Add customer</h2>
+          <p className="mt-1 text-sm text-slate-500">
+            Enter how much credit you are giving the customer.
+          </p>
+        </div>
 
-        <form
-          onSubmit={add}
-          className="grid gap-3 md:grid-cols-[1fr_1fr_auto]"
-        >
-
+        <form onSubmit={add} className="grid gap-3 md:grid-cols-4">
           <Input
             placeholder="Customer name"
             value={name}
@@ -1436,18 +1504,22 @@ function Khata({
             required
           />
 
-          <PrimaryButton>
-            + Add customer
-          </PrimaryButton>
+          <Input
+            type="number"
+            min="0"
+            step="1"
+            placeholder="Amount given"
+            value={givenAmount}
+            onChange={(e) => setGivenAmount(e.target.value)}
+            required
+          />
 
+          <PrimaryButton>+ Add customer</PrimaryButton>
         </form>
-
       </Card>
 
-      <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
-
+      <div className="grid gap-5 lg:grid-cols-[1fr_420px]">
         <div className="space-y-3">
-
           {customers.length === 0 ? (
             <EmptyState
               icon="📒"
@@ -1455,73 +1527,74 @@ function Khata({
               text="Add a customer above to start using Khata."
             />
           ) : (
-            customers.map((c) => (
-              <button
-                className={`block w-full rounded-2xl border bg-white p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${
-                  selected === c.customerId
-                    ? 'border-emerald-500 ring-4 ring-emerald-50'
-                    : 'border-slate-200'
-                }`}
-                onClick={() => setSelected(c.customerId)}
-                key={c.id}
-              >
+            customers.map((c) => {
+              const due = balanceFor(c)
+              const received = ledger
+                .filter(
+                  (l) =>
+                    l.customerId === c.customerId &&
+                    l.direction === 'CREDIT',
+                )
+                .reduce((n, l) => n + l.amount, 0)
 
-                <div className="flex items-center justify-between">
+              return (
+                <button
+                  type="button"
+                  className={`block w-full rounded-2xl border bg-white p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${
+                    selected === c.customerId
+                      ? 'border-emerald-500 ring-4 ring-emerald-50'
+                      : 'border-slate-200'
+                  }`}
+                  onClick={() => setSelected(c.customerId)}
+                  key={c.id}
+                >
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <b className="text-base">{c.name}</b>
+                      <p className="mt-1 text-sm text-slate-500">{c.phone}</p>
 
-                  <div>
-                    <b className="text-base">
-                      {c.name}
-                    </b>
+                      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                        <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-semibold text-slate-600">
+                          Given {money(c.openingBalance)}
+                        </span>
 
-                    <p className="mt-1 text-sm text-slate-500">
-                      {c.phone}
-                    </p>
+                        <span className="rounded-lg bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700">
+                          Received {money(received)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-right">
+                      <p className="text-xs text-slate-400">Current due</p>
+                      <p
+                        className={`text-xl font-bold ${
+                          due > 0
+                            ? 'text-amber-700'
+                            : 'text-emerald-700'
+                        }`}
+                      >
+                        {money(due)}
+                      </p>
+                    </div>
                   </div>
-
-                  <div className="text-right">
-
-                    <p className="text-xs text-slate-400">
-                      Due
-                    </p>
-
-                    <p
-                      className={`font-bold ${
-                        bal(c) > 0
-                          ? 'text-amber-700'
-                          : 'text-emerald-700'
-                      }`}
-                    >
-                      {money(bal(c))}
-                    </p>
-
-                  </div>
-
-                </div>
-
-              </button>
-            ))
+                </button>
+              )
+            })
           )}
-
         </div>
 
-        <Card>
-
+        <Card className="h-fit lg:sticky lg:top-36">
           <div className="flex items-center gap-3">
-
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-emerald-50 text-emerald-700">
               ₹
             </div>
 
             <div>
-              <h2 className="font-bold">
-                Record payment
-              </h2>
-
+              <h2 className="font-bold">Record payment</h2>
               <p className="text-xs text-slate-500">
-                Save a customer payment.
+                Record money received from a customer.
               </p>
             </div>
-
           </div>
 
           <Select
@@ -1529,81 +1602,132 @@ function Khata({
             value={selected}
             onChange={(e) => setSelected(e.target.value)}
           >
-            <option value="">
-              Choose customer
-            </option>
+            <option value="">Choose customer</option>
 
             {customers.map((c) => (
-              <option
-                key={c.id}
-                value={c.customerId}
-              >
+              <option key={c.id} value={c.customerId}>
                 {c.name}
               </option>
             ))}
           </Select>
 
+          {selectedCustomer && (
+            <div className="mt-3 rounded-xl bg-amber-50 p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-amber-800">
+                  Outstanding due
+                </span>
+                <b className="text-lg text-amber-800">
+                  {money(balanceFor(selectedCustomer))}
+                </b>
+              </div>
+            </div>
+          )}
+
           <Input
             className="mt-3"
             type="number"
             min="1"
+            step="1"
             placeholder="Amount received"
             value={amount}
             onChange={(e) => setAmount(e.target.value)}
           />
 
           <PrimaryButton
+            type="button"
             className="mt-3 w-full"
             onClick={pay}
+            disabled={
+              !selectedCustomer ||
+              balanceFor(selectedCustomer) <= 0
+            }
           >
             Save cash payment
           </PrimaryButton>
 
-          {selected && (
-            <div className="mt-6 border-t border-slate-100 pt-5">
+          {selectedCustomer && (
+            <div className="mt-7 border-t border-slate-100 pt-5">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                    Customer history
+                  </p>
+                  <p className="mt-1 text-sm font-bold text-slate-900">
+                    {selectedCustomer.name}
+                  </p>
+                </div>
 
-              <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Transaction history
-              </p>
-
-              <div className="space-y-2">
-
-                {ledger
-                  .filter((l) => l.customerId === selected)
-                  .sort((a, b) =>
-                    a.createdAt.localeCompare(b.createdAt),
-                  )
-                  .map((l) => (
-                    <div
-                      className="flex items-center justify-between rounded-xl bg-slate-50 p-3 text-sm"
-                      key={l.id}
-                    >
-                      <span className="text-slate-600">
-                        {l.description}
-                      </span>
-
-                      <b
-                        className={
-                          l.direction === 'DEBIT'
-                            ? 'text-amber-700'
-                            : 'text-emerald-700'
-                        }
-                      >
-                        {l.direction === 'DEBIT' ? '+' : '-'}
-                        {money(l.amount)}
-                      </b>
-                    </div>
-                  ))}
-
+                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+                  {historyWithDue.length} entries
+                </span>
               </div>
 
+              {historyWithDue.length === 0 ? (
+                <div className="rounded-xl bg-slate-50 p-4 text-center text-sm text-slate-500">
+                  No transactions yet.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {historyWithDue
+                    .slice()
+                    .reverse()
+                    .map((item) => (
+                      <div
+                        className="rounded-xl border border-slate-100 bg-slate-50 p-3"
+                        key={item.id}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-800">
+                              {item.description}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-400">
+                              {new Date(item.createdAt).toLocaleString(
+                                'en-IN',
+                                {
+                                  day: '2-digit',
+                                  month: 'short',
+                                  year: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                },
+                              )}
+                            </p>
+                          </div>
+
+                          <b
+                            className={
+                              item.direction === 'DEBIT'
+                                ? 'text-amber-700'
+                                : 'text-emerald-700'
+                            }
+                          >
+                            {item.direction === 'DEBIT'
+                              ? `+ ${money(item.amount)}`
+                              : `− ${money(item.amount)}`}
+                          </b>
+                        </div>
+
+                        <div className="mt-2 flex items-center justify-between border-t border-slate-200 pt-2 text-xs">
+                          <span className="text-slate-500">
+                            {item.direction === 'DEBIT'
+                              ? 'Credit given'
+                              : 'Money received'}
+                          </span>
+
+                          <span className="font-semibold text-slate-700">
+                            Due after: {money(item.due)}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
             </div>
           )}
-
         </Card>
-
       </div>
-
     </div>
   )
 }
