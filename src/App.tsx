@@ -340,6 +340,211 @@ function Shop({ session }: { session: Session }) {
   const [pending, setPending] = useState(0)
   const [online, setOnline] = useState(navigator.onLine)
 
+  // ---------------------------------------------------------
+  // OFFLINE DEMO DATA
+  // Seeds the local IndexedDB database when using Offline demo.
+  // ---------------------------------------------------------
+  const seedDemoData = async () => {
+    if (session.token !== 'offline-demo') return
+
+    const existingProducts = await localDb.products
+      .where('shopId')
+      .equals(session.shopId)
+      .count()
+
+    // Do not overwrite existing shop data.
+    if (existingProducts > 0) return
+
+    const time = now()
+
+    // =========================
+    // PRODUCTS
+    // =========================
+    const productData = [
+      ['Tata Salt 1kg', 'SALT001', 'packet', 22, 28, 10, 42],
+      ['Aashirvaad Atta 5kg', 'ATTA001', 'bag', 250, 285, 8, 18],
+      ['Amul Milk 1L', 'MILK001', 'packet', 62, 68, 10, 7],
+      ['Maggi 70g', 'MAG001', 'packet', 12, 15, 10, 32],
+      ['Parle-G 800g', 'PARLE001', 'packet', 65, 75, 8, 24],
+      ['Fortune Sunflower Oil 1L', 'OIL001', 'bottle', 130, 145, 10, 12],
+      ['Surf Excel 1kg', 'SURF001', 'packet', 190, 210, 10, 9],
+      ['Coca Cola 750ml', 'COKE001', 'bottle', 35, 40, 8, 25],
+      ['Thums Up 750ml', 'THUMS001', 'bottle', 35, 40, 8, 21],
+      ['Britannia Good Day', 'BRIT001', 'packet', 25, 30, 8, 16],
+      ['Dairy Milk 40g', 'DAIRY001', 'bar', 30, 40, 8, 19],
+      ['Colgate 200g', 'COLGATE001', 'tube', 85, 105, 5, 11],
+    ]
+
+    const products: Product[] = productData.map(
+      ([
+        name,
+        sku,
+        unit,
+        purchasePrice,
+        sellingPrice,
+        minimumStock,
+        currentStock,
+      ]) => ({
+        id: id(),
+        productId: id(),
+        shopId: session.shopId,
+        name: name as string,
+        sku: sku as string,
+        unit: unit as string,
+        purchasePrice: purchasePrice as number,
+        sellingPrice: sellingPrice as number,
+        minimumStock: minimumStock as number,
+        currentStock: currentStock as number,
+        createdAt: time,
+        updatedAt: time,
+      }),
+    )
+
+    // Insert products independently so an unrelated demo record
+    // cannot roll back the inventory data.
+    await localDb.products.bulkPut(products)
+
+    // =========================
+    // CUSTOMERS
+    // =========================
+    const customerData = [
+      ['Rahul Sharma', '9876543210', 1250],
+      ['Amit Kumar', '9812345678', 780],
+      ['Priya Singh', '9898765432', 450],
+      ['Rohit Gupta', '9765432109', 2100],
+      ['Anjali Verma', '9823456710', 320],
+      ['Vikash Yadav', '9798765432', 650],
+    ]
+
+    const customers: Customer[] = customerData.map(
+      ([name, phone, openingBalance]) => {
+        const customerId = id()
+
+        return {
+          id: customerId,
+          customerId,
+          shopId: session.shopId,
+          name: name as string,
+          phone: phone as string,
+          openingBalance: openingBalance as number,
+          interestEnabled: false,
+          createdAt: time,
+          updatedAt: time,
+        }
+      },
+    )
+
+    await localDb.customers.bulkPut(customers)
+
+    // =========================
+    // SUPPLIERS
+    // =========================
+    const suppliers: Supplier[] = [
+      {
+        id: id(),
+        supplierId: id(),
+        shopId: session.shopId,
+        name: 'Sharma Wholesale',
+        createdAt: time,
+        updatedAt: time,
+      },
+      {
+        id: id(),
+        supplierId: id(),
+        shopId: session.shopId,
+        name: 'Bharat FMCG Distributors',
+        createdAt: time,
+        updatedAt: time,
+      },
+      {
+        id: id(),
+        supplierId: id(),
+        shopId: session.shopId,
+        name: 'Metro General Suppliers',
+        createdAt: time,
+        updatedAt: time,
+      },
+    ]
+
+    await localDb.suppliers.bulkPut(suppliers)
+
+    // =========================
+    // DEMO SALES
+    // =========================
+    const saleProducts = products.slice(0, 5)
+
+    const makeSale = (
+      productIndex: number,
+      quantity: number,
+      customerId?: string,
+    ): Sale => {
+      const product = saleProducts[productIndex]
+      const saleId = id()
+      const transactionId = id()
+
+      const saleItem: SaleItem = {
+        saleItemId: id(),
+        saleId,
+        productId: product.productId,
+        quantity,
+        price: product.sellingPrice,
+        purchasePrice: product.purchasePrice,
+      }
+
+      const total = quantity * product.sellingPrice
+
+      return {
+        id: saleId,
+        saleId,
+        shopId: session.shopId,
+        customerId,
+        items: [saleItem],
+        subtotal: total,
+        discount: 0,
+        tax: 0,
+        total,
+        paymentMethod: customerId ? 'CREDIT' : 'CASH',
+        paymentStatus: customerId ? 'PENDING' : 'SUCCESS',
+        transactionId,
+        createdAt: time,
+        updatedAt: time,
+      }
+    }
+
+    const sale1 = makeSale(0, 3)
+    const sale2 = makeSale(1, 1)
+    const sale3 = makeSale(3, 4, customers[0].customerId)
+
+    await localDb.sales.bulkPut([sale1, sale2, sale3])
+
+    await localDb.saleItems.bulkPut([
+      ...sale1.items,
+      ...sale2.items,
+      ...sale3.items,
+    ] as SaleItem[])
+
+    // =========================
+    // KHATA / LEDGER
+    // =========================
+    const ledgerEntry: LedgerTransaction = {
+      id: id(),
+      shopId: session.shopId,
+      transactionId: id(),
+      customerId: customers[0].customerId,
+      type: 'SALE',
+      direction: 'DEBIT',
+      amount: sale3.total,
+      referenceId: sale3.saleId,
+      description: 'Demo credit sale',
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.ledgerTransactions.put(ledgerEntry)
+
+    console.log('DukaanSaathi: offline demo data seeded successfully')
+  }
+
   const refresh = async () => {
     setProducts(
       await localDb.products
@@ -364,7 +569,7 @@ function Shop({ session }: { session: Session }) {
   }
 
   useEffect(() => {
-    void refresh()
+    void seedDemoData().then(refresh)
 
     const on = () => {
       setOnline(true)
