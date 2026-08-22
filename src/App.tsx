@@ -1277,9 +1277,22 @@ function Khata({
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [givenAmount, setGivenAmount] = useState('')
+  const [givenDateTime, setGivenDateTime] = useState('')
   const [selected, setSelected] = useState('')
   const [amount, setAmount] = useState('')
+  const [paymentDateTime, setPaymentDateTime] = useState('')
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
+
+  // Converts a <input type="datetime-local"> value into an ISO timestamp.
+  // Falls back to the current time when the field is left blank.
+  const toIsoOrNow = (value: string) => {
+    if (!value) return now()
+
+    const parsed = new Date(value)
+    if (Number.isNaN(parsed.getTime())) return now()
+
+    return parsed.toISOString()
+  }
 
   const loadLedger = async () => {
     setLedger(
@@ -1298,7 +1311,7 @@ function Khata({
     e.preventDefault()
 
     const openingAmount = Math.max(0, Number(givenAmount) || 0)
-    const time = now()
+    const time = toIsoOrNow(givenDateTime)
     const customerId = id()
     const transactionId = id()
 
@@ -1335,6 +1348,7 @@ function Khata({
     setName('')
     setPhone('')
     setGivenAmount('')
+    setGivenDateTime('')
 
     await refresh()
     await loadLedger()
@@ -1364,6 +1378,8 @@ function Khata({
     | 'dueAsc'
     | 'advanceDesc'
     | 'advanceAsc'
+    | 'daysDesc'
+    | 'daysAsc'
   >('default')
 
   // Pending due = positive balance (customer owes us), Advance = negative balance (we owe customer / customer overpaid).
@@ -1373,13 +1389,57 @@ function Khata({
   const advanceAmount = (balance: number) =>
     balance < 0 ? Math.abs(balance) : 0
 
+  // Earliest date this customer started owing money that is still unpaid,
+  // based on the opening balance and any DEBIT (credit given) ledger entries.
+  const oldestDueTimestamp = (c: Customer) => {
+    const timestamps: number[] = []
+
+    if (c.openingBalance > 0) {
+      timestamps.push(new Date(c.createdAt).getTime())
+    }
+
+    ledger
+      .filter(
+        (l) =>
+          l.customerId === c.customerId &&
+          l.direction === 'DEBIT',
+      )
+      .forEach((l) =>
+        timestamps.push(new Date(l.createdAt).getTime()),
+      )
+
+    if (timestamps.length === 0) return null
+
+    return Math.min(...timestamps)
+  }
+
+  // Number of days a customer's current due has been outstanding.
+  // Customers with no due are treated as 0 days.
+  const daysPending = (c: Customer, balance: number) => {
+    if (balance <= 0) return 0
+
+    const oldest = oldestDueTimestamp(c)
+    if (oldest === null) return 0
+
+    const diffMs = Date.now() - oldest
+    return Math.max(
+      0,
+      Math.floor(diffMs / (1000 * 60 * 60 * 24)),
+    )
+  }
+
   const sortedCustomers = useMemo(() => {
     if (customerSort === 'default') return customers
 
-    const withBalance = customers.map((c) => ({
-      customer: c,
-      balance: balanceFor(c),
-    }))
+    const withBalance = customers.map((c) => {
+      const balance = balanceFor(c)
+
+      return {
+        customer: c,
+        balance,
+        days: daysPending(c, balance),
+      }
+    })
 
     withBalance.sort((a, b) => {
       switch (customerSort) {
@@ -1401,6 +1461,10 @@ function Khata({
             advanceAmount(a.balance) -
             advanceAmount(b.balance)
           )
+        case 'daysDesc':
+          return b.days - a.days
+        case 'daysAsc':
+          return a.days - b.days
         default:
           return 0
       }
@@ -1453,7 +1517,7 @@ function Khata({
       }
     }
 
-    const time = now()
+    const time = toIsoOrNow(paymentDateTime)
     const transactionId = id()
 
     const payment: Payment = {
@@ -1505,6 +1569,7 @@ function Khata({
     )
 
     setAmount('')
+    setPaymentDateTime('')
     await refresh()
     await loadLedger()
   }
@@ -1578,7 +1643,7 @@ function Khata({
 
         <form
           onSubmit={add}
-          className="grid gap-3 md:grid-cols-4"
+          className="grid gap-3 md:grid-cols-5"
         >
           <Input
             placeholder="Customer name"
@@ -1605,6 +1670,20 @@ function Khata({
             }
             required
           />
+
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-slate-500">
+              Date &amp; time (optional)
+            </label>
+
+            <Input
+              type="datetime-local"
+              value={givenDateTime}
+              onChange={(e) =>
+                setGivenDateTime(e.target.value)
+              }
+            />
+          </div>
 
           <PrimaryButton>
             + Add customer
@@ -1643,6 +1722,12 @@ function Khata({
                 <option value="advanceAsc">
                   Advance received: Low to High
                 </option>
+                <option value="daysDesc">
+                  Pending since: Max days to Min days
+                </option>
+                <option value="daysAsc">
+                  Pending since: Min days to Max days
+                </option>
               </select>
             </div>
           )}
@@ -1670,6 +1755,7 @@ function Khata({
 
               const hasDue = balance > 0
               const hasAdvance = balance < 0
+              const pendingDays = daysPending(c, balance)
 
               return (
                 <button
@@ -1715,6 +1801,15 @@ function Khata({
 
                           <p className="text-xl font-bold text-amber-700">
                             {money(balance)}
+                          </p>
+
+                          <p className="mt-1 text-xs font-semibold text-amber-600">
+                            Pending{' '}
+                            {pendingDays === 0
+                              ? 'since today'
+                              : pendingDays === 1
+                                ? 'for 1 day'
+                                : `for ${pendingDays} days`}
                           </p>
                         </>
                       ) : hasAdvance ? (
@@ -1853,24 +1948,29 @@ function Khata({
             onChange={(e) =>
               setAmount(e.target.value)
             }
-            disabled={
-              !selectedCustomer ||
-              balanceFor(
-                selectedCustomer as Customer,
-              ) <= 0
-            }
+            disabled={!selectedCustomer}
           />
+
+          <div className="mt-3">
+            <label className="mb-1 block text-xs font-semibold text-slate-500">
+              Date &amp; time (optional)
+            </label>
+
+            <Input
+              type="datetime-local"
+              value={paymentDateTime}
+              onChange={(e) =>
+                setPaymentDateTime(e.target.value)
+              }
+              disabled={!selectedCustomer}
+            />
+          </div>
 
           <PrimaryButton
             type="button"
             className="mt-3 w-full"
             onClick={pay}
-            disabled={
-              !selectedCustomer ||
-              balanceFor(
-                selectedCustomer as Customer,
-              ) <= 0
-            }
+            disabled={!selectedCustomer}
           >
             Save cash payment
           </PrimaryButton>
