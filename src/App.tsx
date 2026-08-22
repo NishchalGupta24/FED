@@ -1419,13 +1419,26 @@ function Khata({
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [givenAmount, setGivenAmount] = useState('')
+  const [givenDateTime, setGivenDateTime] = useState('')
   const [selected, setSelected] = useState('')
   const [amount, setAmount] = useState('')
+  const [paymentDateTime, setPaymentDateTime] = useState('')
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
   const [sales, setSales] = useState<Sale[]>([])
   const [historyCustomerId, setHistoryCustomerId] = useState<
     string | null
   >(null)
+
+  // Converts a <input type="datetime-local"> value into an ISO timestamp.
+  // Falls back to the current time when the field is left blank.
+  const toIsoOrNow = (value: string) => {
+    if (!value) return now()
+
+    const parsed = new Date(value)
+    if (Number.isNaN(parsed.getTime())) return now()
+
+    return parsed.toISOString()
+  }
 
   const loadLedger = async () => {
     setLedger(
@@ -1454,7 +1467,7 @@ function Khata({
     e.preventDefault()
 
     const openingAmount = Math.max(0, Number(givenAmount) || 0)
-    const time = now()
+    const time = toIsoOrNow(givenDateTime)
     const customerId = id()
     const transactionId = id()
 
@@ -1491,11 +1504,58 @@ function Khata({
     setName('')
     setPhone('')
     setGivenAmount('')
+    setGivenDateTime('')
 
     await refresh()
     await loadLedger()
 
     setSelected(customerId)
+  }
+
+  const deleteCustomerRecords = async (customer: Customer) => {
+    const confirmed = window.confirm(
+      `Delete ${customer.name}'s customer record?`,
+    )
+
+    if (!confirmed) return
+
+    const confirmedAgain = window.confirm(
+      `This will permanently delete ${customer.name}'s record and transaction history. Continue?`,
+    )
+
+    if (!confirmedAgain) return
+
+    await localDb.transaction(
+      'rw',
+      localDb.customers,
+      localDb.ledgerTransactions,
+      async () => {
+        await localDb.customers
+          .where('id')
+          .equals(customer.id)
+          .delete()
+
+        await localDb.ledgerTransactions
+          .where('shopId')
+          .equals(session.shopId)
+          .filter((transaction) =>
+            transaction.customerId === customer.customerId,
+          )
+          .delete()
+      },
+    )
+
+    if (selected === customer.customerId) {
+      setSelected('')
+    }
+
+    if (historyCustomerId === customer.customerId) {
+      setHistoryCustomerId(null)
+    }
+
+    await refresh()
+    await loadLedger()
+    await loadSales()
   }
 
   // Positive balance = customer still has to pay us
@@ -1522,6 +1582,124 @@ function Khata({
     ? buildCustomerBills(historyCustomer, sales, ledger, products)
     : []
 
+  const [customerSort, setCustomerSort] = useState<
+    | 'default'
+    | 'dueDesc'
+    | 'dueAsc'
+    | 'advanceDesc'
+    | 'advanceAsc'
+    | 'daysDesc'
+    | 'daysAsc'
+  >('default')
+
+  const PENDING_FILTER_OPTIONS = [
+    500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000,
+    9000, 10000,
+  ] as const
+
+  const [pendingFilter, setPendingFilter] = useState<
+    'all' | (typeof PENDING_FILTER_OPTIONS)[number]
+  >('all')
+
+  // Pending due = positive balance (customer owes us), Advance = negative balance (we owe customer / customer overpaid).
+  const dueAmount = (balance: number) =>
+    balance > 0 ? balance : 0
+
+  const advanceAmount = (balance: number) =>
+    balance < 0 ? Math.abs(balance) : 0
+
+  // Earliest date this customer started owing money that is still unpaid,
+  // based on the opening balance and any DEBIT (credit given) ledger entries.
+  const oldestDueTimestamp = (c: Customer) => {
+    const timestamps: number[] = []
+
+    if (c.openingBalance > 0) {
+      timestamps.push(new Date(c.createdAt).getTime())
+    }
+
+    ledger
+      .filter(
+        (l) =>
+          l.customerId === c.customerId &&
+          l.direction === 'DEBIT',
+      )
+      .forEach((l) =>
+        timestamps.push(new Date(l.createdAt).getTime()),
+      )
+
+    if (timestamps.length === 0) return null
+
+    return Math.min(...timestamps)
+  }
+
+  // Number of days a customer's current due has been outstanding.
+  // Customers with no due are treated as 0 days.
+  const daysPending = (c: Customer, balance: number) => {
+    if (balance <= 0) return 0
+
+    const oldest = oldestDueTimestamp(c)
+    if (oldest === null) return 0
+
+    const diffMs = Date.now() - oldest
+    return Math.max(
+      0,
+      Math.floor(diffMs / (1000 * 60 * 60 * 24)),
+    )
+  }
+
+  const sortedCustomers = useMemo(() => {
+    const filtered =
+      pendingFilter === 'all'
+        ? customers
+        : customers.filter(
+            (c) => dueAmount(balanceFor(c)) > pendingFilter,
+          )
+
+    if (customerSort === 'default') return filtered
+
+    const withBalance = filtered.map((c) => {
+      const balance = balanceFor(c)
+
+      return {
+        customer: c,
+        balance,
+        days: daysPending(c, balance),
+      }
+    })
+
+    withBalance.sort((a, b) => {
+      switch (customerSort) {
+        case 'dueDesc':
+          return (
+            dueAmount(b.balance) - dueAmount(a.balance)
+          )
+        case 'dueAsc':
+          return (
+            dueAmount(a.balance) - dueAmount(b.balance)
+          )
+        case 'advanceDesc':
+          return (
+            advanceAmount(b.balance) -
+            advanceAmount(a.balance)
+          )
+        case 'advanceAsc':
+          return (
+            advanceAmount(a.balance) -
+            advanceAmount(b.balance)
+          )
+        case 'daysDesc':
+          return b.days - a.days
+        case 'daysAsc':
+          return a.days - b.days
+        default:
+          return 0
+      }
+    })
+
+    return withBalance.map((w) => w.customer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customers, ledger, customerSort, pendingFilter])
+
   const pay = async () => {
     if (!selectedCustomer) {
       alert('Choose a customer first')
@@ -1537,30 +1715,35 @@ function Khata({
 
     const due = balanceFor(selectedCustomer)
 
-    if (due <= 0) {
-      if (due < 0) {
+    if (received > due) {
+      const advanceAmount = received - due
+
+      if (due > 0) {
         alert(
-          `This customer has already paid ${money(
-            Math.abs(due),
-          )} in advance.`,
+          `This clears the outstanding due of ${money(
+            due,
+          )} and records the remaining ${money(
+            advanceAmount,
+          )} as an advance from the customer.`,
+        )
+      } else if (due === 0) {
+        alert(
+          `This customer has no outstanding due. ${money(
+            advanceAmount,
+          )} will be recorded as an advance from the customer.`,
         )
       } else {
-        alert('This customer has no outstanding due.')
+        alert(
+          `This adds ${money(
+            advanceAmount,
+          )} to the customer's existing advance of ${money(
+            Math.abs(due),
+          )}.`,
+        )
       }
-
-      return
     }
 
-    if (received > due) {
-      alert(
-        `You can receive maximum ${money(
-          due,
-        )} because that is the current outstanding due.`,
-      )
-      return
-    }
-
-    const time = now()
+    const time = toIsoOrNow(paymentDateTime)
     const transactionId = id()
 
     const payment: Payment = {
@@ -1612,6 +1795,7 @@ function Khata({
     )
 
     setAmount('')
+    setPaymentDateTime('')
     await refresh()
     await loadLedger()
   }
@@ -1685,7 +1869,7 @@ function Khata({
 
         <form
           onSubmit={add}
-          className="grid gap-3 md:grid-cols-4"
+          className="grid gap-3 md:grid-cols-5"
         >
           <Input
             placeholder="Customer name"
@@ -1713,6 +1897,20 @@ function Khata({
             required
           />
 
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-slate-500">
+              Date &amp; time (optional)
+            </label>
+
+            <Input
+              type="datetime-local"
+              value={givenDateTime}
+              onChange={(e) =>
+                setGivenDateTime(e.target.value)
+              }
+            />
+          </div>
+
           <PrimaryButton>
             + Add customer
           </PrimaryButton>
@@ -1722,14 +1920,84 @@ function Khata({
       <div className="grid gap-5 lg:grid-cols-[1fr_420px]">
         {/* CUSTOMER LIST */}
         <div className="space-y-3">
+          {customers.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="font-bold text-slate-950">
+                Customers
+              </h2>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={pendingFilter}
+                  onChange={(e) =>
+                    setPendingFilter(
+                      (e.target.value === 'all'
+                        ? 'all'
+                        : Number(
+                            e.target.value,
+                          )) as typeof pendingFilter,
+                    )
+                  }
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
+                >
+                  <option value="all">
+                    Filter: All customers
+                  </option>
+
+                  {PENDING_FILTER_OPTIONS.map((amt) => (
+                    <option key={amt} value={amt}>
+                      Pending above {money(amt)}
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  value={customerSort}
+                  onChange={(e) =>
+                    setCustomerSort(
+                      e.target.value as typeof customerSort,
+                    )
+                  }
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
+                >
+                  <option value="default">Sort by</option>
+                  <option value="dueDesc">
+                    Pending due: High to Low
+                  </option>
+                  <option value="dueAsc">
+                    Pending due: Low to High
+                  </option>
+                  <option value="advanceDesc">
+                    Advance received: High to Low
+                  </option>
+                  <option value="advanceAsc">
+                    Advance received: Low to High
+                  </option>
+                  <option value="daysDesc">
+                    Pending since: Max days to Min days
+                  </option>
+                  <option value="daysAsc">
+                    Pending since: Min days to Max days
+                  </option>
+                </select>
+              </div>
+            </div>
+          )}
+
           {customers.length === 0 ? (
             <EmptyState
               icon="📒"
               title="No customers yet"
               text="Add a customer above to start using Khata."
             />
+          ) : sortedCustomers.length === 0 ? (
+            <EmptyState
+              icon="🔍"
+              title="No customers match this filter"
+              text="Try a lower pending amount or clear the filter."
+            />
           ) : (
-            customers.map((c) => {
+            sortedCustomers.map((c) => {
               const balance = balanceFor(c)
 
               const received = ledger
@@ -1745,6 +2013,7 @@ function Khata({
 
               const hasDue = balance > 0
               const hasAdvance = balance < 0
+              const pendingDays = daysPending(c, balance)
 
               return (
                 <button
@@ -1789,6 +2058,17 @@ function Khata({
                     </div>
 
                     <div className="text-right">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void deleteCustomerRecords(c)
+                        }}
+                        className="mb-3 rounded-lg border border-rose-200 px-2.5 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-50"
+                      >
+                        Delete
+                      </button>
+
                       {hasDue ? (
                         <>
                           <p className="text-xs text-slate-400">
@@ -1797,6 +2077,15 @@ function Khata({
 
                           <p className="text-xl font-bold text-amber-700">
                             {money(balance)}
+                          </p>
+
+                          <p className="mt-1 text-xs font-semibold text-amber-600">
+                            Pending{' '}
+                            {pendingDays === 0
+                              ? 'since today'
+                              : pendingDays === 1
+                                ? 'for 1 day'
+                                : `for ${pendingDays} days`}
                           </p>
                         </>
                       ) : hasAdvance ? (
@@ -1935,24 +2224,29 @@ function Khata({
             onChange={(e) =>
               setAmount(e.target.value)
             }
-            disabled={
-              !selectedCustomer ||
-              balanceFor(
-                selectedCustomer as Customer,
-              ) <= 0
-            }
+            disabled={!selectedCustomer}
           />
+
+          <div className="mt-3">
+            <label className="mb-1 block text-xs font-semibold text-slate-500">
+              Date &amp; time (optional)
+            </label>
+
+            <Input
+              type="datetime-local"
+              value={paymentDateTime}
+              onChange={(e) =>
+                setPaymentDateTime(e.target.value)
+              }
+              disabled={!selectedCustomer}
+            />
+          </div>
 
           <PrimaryButton
             type="button"
             className="mt-3 w-full"
             onClick={pay}
-            disabled={
-              !selectedCustomer ||
-              balanceFor(
-                selectedCustomer as Customer,
-              ) <= 0
-            }
+            disabled={!selectedCustomer}
           >
             Save cash payment
           </PrimaryButton>
