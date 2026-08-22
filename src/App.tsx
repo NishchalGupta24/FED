@@ -1382,7 +1382,16 @@ function Khata({
     | 'daysAsc'
   >('default')
 
-  // Due (credit given) = positive balance, Advance = negative balance.
+  const PENDING_FILTER_OPTIONS = [
+    500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000,
+    9000, 10000,
+  ] as const
+
+  const [pendingFilter, setPendingFilter] = useState<
+    'all' | (typeof PENDING_FILTER_OPTIONS)[number]
+  >('all')
+
+  // Pending due = positive balance (customer owes us), Advance = negative balance (we owe customer / customer overpaid).
   const dueAmount = (balance: number) =>
     balance > 0 ? balance : 0
 
@@ -1429,9 +1438,16 @@ function Khata({
   }
 
   const sortedCustomers = useMemo(() => {
-    if (customerSort === 'default') return customers
+    const filtered =
+      pendingFilter === 'all'
+        ? customers
+        : customers.filter(
+            (c) => dueAmount(balanceFor(c)) > pendingFilter,
+          )
 
-    const withBalance = customers.map((c) => {
+    if (customerSort === 'default') return filtered
+
+    const withBalance = filtered.map((c) => {
       const balance = balanceFor(c)
 
       return {
@@ -1472,7 +1488,7 @@ function Khata({
 
     return withBalance.map((w) => w.customer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [customers, ledger, customerSort])
+  }, [customers, ledger, customerSort, pendingFilter])
 
   const pay = async () => {
     if (!selectedCustomer) {
@@ -1695,40 +1711,66 @@ function Khata({
         {/* CUSTOMER LIST */}
         <div className="space-y-3">
           {customers.length > 0 && (
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="font-bold text-slate-950">
                 Customers
               </h2>
 
-              <select
-                value={customerSort}
-                onChange={(e) =>
-                  setCustomerSort(
-                    e.target.value as typeof customerSort,
-                  )
-                }
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
-              >
-                <option value="default">Sort by</option>
-                <option value="dueDesc">
-                  Credit given: High to Low
-                </option>
-                <option value="dueAsc">
-                  Credit given: Low to High
-                </option>
-                <option value="advanceDesc">
-                  Advance received: High to Low
-                </option>
-                <option value="advanceAsc">
-                  Advance received: Low to High
-                </option>
-                <option value="daysDesc">
-                  Pending since: Max days to Min days
-                </option>
-                <option value="daysAsc">
-                  Pending since: Min days to Max days
-                </option>
-              </select>
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={pendingFilter}
+                  onChange={(e) =>
+                    setPendingFilter(
+                      (e.target.value === 'all'
+                        ? 'all'
+                        : Number(
+                            e.target.value,
+                          )) as typeof pendingFilter,
+                    )
+                  }
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
+                >
+                  <option value="all">
+                    Filter: All customers
+                  </option>
+
+                  {PENDING_FILTER_OPTIONS.map((amt) => (
+                    <option key={amt} value={amt}>
+                      Pending above {money(amt)}
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  value={customerSort}
+                  onChange={(e) =>
+                    setCustomerSort(
+                      e.target.value as typeof customerSort,
+                    )
+                  }
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm focus:border-emerald-400 focus:outline-none"
+                >
+                  <option value="default">Sort by</option>
+                  <option value="dueDesc">
+                    Pending due: High to Low
+                  </option>
+                  <option value="dueAsc">
+                    Pending due: Low to High
+                  </option>
+                  <option value="advanceDesc">
+                    Advance received: High to Low
+                  </option>
+                  <option value="advanceAsc">
+                    Advance received: Low to High
+                  </option>
+                  <option value="daysDesc">
+                    Pending since: Max days to Min days
+                  </option>
+                  <option value="daysAsc">
+                    Pending since: Min days to Max days
+                  </option>
+                </select>
+              </div>
             </div>
           )}
 
@@ -1737,6 +1779,12 @@ function Khata({
               icon="📒"
               title="No customers yet"
               text="Add a customer above to start using Khata."
+            />
+          ) : sortedCustomers.length === 0 ? (
+            <EmptyState
+              icon="🔍"
+              title="No customers match this filter"
+              text="Try a lower pending amount or clear the filter."
             />
           ) : (
             sortedCustomers.map((c) => {
