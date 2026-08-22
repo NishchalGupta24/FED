@@ -1382,7 +1382,7 @@ function Khata({
     | 'daysAsc'
   >('default')
 
-  // Pending due = positive balance (customer owes us), Advance = negative balance (we owe customer / customer overpaid).
+  // Due (credit given) = positive balance, Advance = negative balance.
   const dueAmount = (balance: number) =>
     balance > 0 ? balance : 0
 
@@ -1711,10 +1711,10 @@ function Khata({
               >
                 <option value="default">Sort by</option>
                 <option value="dueDesc">
-                  Pending due: High to Low
+                  Credit given: High to Low
                 </option>
                 <option value="dueAsc">
-                  Pending due: Low to High
+                  Credit given: Low to High
                 </option>
                 <option value="advanceDesc">
                   Advance received: High to Low
