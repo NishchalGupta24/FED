@@ -3505,6 +3505,13 @@ function Pos({
 }: Ctx) {
   const [cart, setCart] = useState<Record<string, number>>({})
   const [customerId, setCustomerId] = useState('')
+  const [captureCustomerDetails, setCaptureCustomerDetails] =
+    useState(false)
+  const [customerName, setCustomerName] = useState('')
+  const [customerPhone, setCustomerPhone] = useState('')
+  const [discountMode, setDiscountMode] =
+    useState<'AMOUNT' | 'PERCENT'>('AMOUNT')
+  const [discountInput, setDiscountInput] = useState('')
   const [method, setMethod] =
     useState<'CASH' | 'CREDIT' | 'UPI'>('CASH')
   const [showUpi, setShowUpi] = useState(false)
@@ -3551,35 +3558,128 @@ function Pos({
     void loadPendingSales()
   }, [session.shopId])
 
-  const total = useMemo(
+  const selectedCustomer = useMemo(
     () =>
-      products.reduce(
-        (n, p) =>
-          n + (cart[p.productId] || 0) * p.sellingPrice,
-        0,
+      customers.find(
+        (c) => c.customerId === customerId,
       ),
-    [products, cart],
+    [customers, customerId],
   )
 
+  const billItems = useMemo(
+    () =>
+      Object.entries(cart)
+        .filter(([, quantity]) => quantity > 0)
+        .map(([pid, quantity]) => {
+          const product = products.find(
+            (p) => p.productId === pid,
+          )
+
+          return product
+            ? { product, quantity }
+            : null
+        })
+        .filter(
+          (
+            item,
+          ): item is { product: Product; quantity: number } =>
+            item !== null,
+        ),
+    [cart, products],
+  )
+
+  const subtotal = useMemo(
+    () =>
+      billItems.reduce(
+        (sum, item) =>
+          sum + item.product.sellingPrice * item.quantity,
+        0,
+      ),
+    [billItems],
+  )
+
+  const canEditDiscount = session.role === 'OWNER'
+
+  const discount = useMemo(() => {
+    if (!canEditDiscount) {
+      return 0
+    }
+
+    const entered = parseFloat(discountInput) || 0
+
+    if (entered <= 0 || subtotal <= 0) {
+      return 0
+    }
+
+    const rawDiscount =
+      discountMode === 'PERCENT'
+        ? (subtotal * entered) / 100
+        : entered
+
+    return Math.min(subtotal, Math.max(0, rawDiscount))
+  }, [canEditDiscount, discountInput, discountMode, subtotal])
+
+  const total = useMemo(
+    () => Math.max(0, subtotal - discount),
+    [subtotal, discount],
+  )
+
+  const totalItems = useMemo(
+    () =>
+      billItems.reduce(
+        (count, item) => count + item.quantity,
+        0,
+      ),
+    [billItems],
+  )
+
+  useEffect(() => {
+    if (!selectedCustomer) {
+      return
+    }
+
+    setCaptureCustomerDetails(true)
+    setCustomerName(selectedCustomer.name || '')
+    setCustomerPhone(selectedCustomer.phone || '')
+  }, [selectedCustomer])
+
+  useEffect(() => {
+    if (!captureCustomerDetails) {
+      setCustomerName('')
+      setCustomerPhone('')
+    }
+  }, [captureCustomerDetails])
+
+  const normalizedCustomerName =
+    customerName.trim() || selectedCustomer?.name || ''
+
+  const normalizedCustomerPhone =
+    customerPhone.trim() || selectedCustomer?.phone || ''
+
+  const saleDiscount = Number(discount.toFixed(2))
+  const finalTotal = Number(total.toFixed(2))
+  const finalSubtotal = Number(subtotal.toFixed(2))
+
+  const canCheckout = billItems.length > 0
+
   const transactionId = id()
+  )
 
   const upi =
     `upi://pay?pa=saathikirana@upi` +
     `&pn=Saathi%20Kirana%20Store` +
-    `&am=${total.toFixed(2)}` +
+    `&am=${finalTotal.toFixed(2)}` +
     `&tn=DukaanSaathi%20sale` +
     `&tr=${transactionId}`
 
   const checkout = async () => {
-    const items = products
-      .filter((p) => cart[p.productId])
-      .map((p) => ({
+    const items = billItems.map((item) => ({
         saleItemId: id(),
         saleId: '',
-        productId: p.productId,
-        quantity: cart[p.productId],
-        price: p.sellingPrice,
-        purchasePrice: p.purchasePrice,
+        productId: item.product.productId,
+        quantity: item.quantity,
+        price: item.product.sellingPrice,
+        purchasePrice: item.product.purchasePrice,
       }))
 
     if (
@@ -3612,11 +3712,19 @@ function Pos({
       shopId: session.shopId,
       customerId:
         method === 'CREDIT' ? customerId : undefined,
+      customerName:
+        captureCustomerDetails && normalizedCustomerName
+          ? normalizedCustomerName
+          : undefined,
+      customerPhone:
+        captureCustomerDetails && normalizedCustomerPhone
+          ? normalizedCustomerPhone
+          : undefined,
       items,
-      subtotal: total,
-      discount: 0,
+      subtotal: finalSubtotal,
+      discount: saleDiscount,
       tax: 0,
-      total,
+      total: finalTotal,
       paymentMethod: method,
       paymentStatus:
         method === 'CREDIT'
@@ -3636,7 +3744,7 @@ function Pos({
             paymentId: id(),
             shopId: session.shopId,
             saleId,
-            amount: total,
+            amount: finalTotal,
             status: 'SUCCESS',
             provider: method,
             transactionId: `${tid}:payment`,
@@ -3697,7 +3805,7 @@ function Pos({
             customerId,
             type: 'SALE',
             direction: 'DEBIT',
-            amount: total,
+            amount: finalTotal,
             referenceId: saleId,
             description: 'Credit sale',
             createdAt: time,
@@ -3731,12 +3839,17 @@ function Pos({
 
     setCart({})
     setCustomerId('')
+    setCaptureCustomerDetails(false)
+    setCustomerName('')
+    setCustomerPhone('')
+    setDiscountMode('AMOUNT')
+    setDiscountInput('')
     setShowUpi(false)
     setUpiPaymentReceived(false)
 
     await refresh()
 
-    alert(`Receipt saved locally: ${money(total)}`)
+    alert(`Receipt saved locally: ${money(finalTotal)}`)
   }
 
   const finalizeDelivery = async (
@@ -4200,34 +4313,28 @@ function Pos({
               </h2>
 
               <p className="text-xs text-slate-500">
-                {Object.values(cart).reduce(
-                  (a, b) => a + b,
-                  0,
-                )}{' '}
+                {totalItems}{' '}
                 items
               </p>
             </div>
 
             <div className="rounded-xl bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-700">
-              {money(total)}
+              {money(finalTotal)}
             </div>
 
           </div>
 
           <div className="mt-5 space-y-2">
 
-            {Object.entries(cart).length === 0 ? (
+            {billItems.length === 0 ? (
               <div className="rounded-xl bg-slate-50 p-5 text-center text-sm text-slate-400">
                 Your bill is empty.
                 <br />
                 Select products to begin.
               </div>
             ) : (
-              Object.entries(cart).map(
-                ([pid, q]) => {
-                  const p = products.find(
-                    (v) => v.productId === pid,
-                  )!
+              billItems.map(({ product: p, quantity: q }) => {
+                  const pid = p.productId
 
                   return (
                     <div
@@ -4262,13 +4369,34 @@ function Pos({
 
                     </div>
                   )
-                },
-              )
+                })
             )}
 
           </div>
 
           <div className="my-5 border-t border-slate-100 pt-4">
+
+            <div className="mb-2 flex justify-between text-sm">
+              <span className="text-slate-500">
+                Subtotal
+              </span>
+
+              <span className="font-semibold text-slate-700">
+                {money(finalSubtotal)}
+              </span>
+            </div>
+
+            {saleDiscount > 0 && (
+              <div className="mb-2 flex justify-between text-sm">
+                <span className="text-slate-500">
+                  Discount
+                </span>
+
+                <span className="font-semibold text-emerald-700">
+                  - {money(saleDiscount)}
+                </span>
+              </div>
+            )}
 
             <div className="flex justify-between">
               <span className="text-sm text-slate-500">
@@ -4276,13 +4404,133 @@ function Pos({
               </span>
 
               <span className="text-2xl font-bold">
-                {money(total)}
+                {money(finalTotal)}
               </span>
             </div>
 
           </div>
 
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-sm font-semibold text-slate-800">
+                Customer details
+              </p>
+
+              <label className="flex items-center gap-2 text-xs font-semibold text-slate-600">
+                <input
+                  type="checkbox"
+                  checked={captureCustomerDetails}
+                  onChange={(e) =>
+                    setCaptureCustomerDetails(e.target.checked)
+                  }
+                />
+                Add to this bill
+              </label>
+            </div>
+
+            {captureCustomerDetails && (
+              <div className="space-y-2">
+                <Input
+                  value={customerName}
+                  onChange={(e) =>
+                    setCustomerName(e.target.value)
+                  }
+                  placeholder="Customer name"
+                />
+
+                <Input
+                  value={customerPhone}
+                  onChange={(e) =>
+                    setCustomerPhone(e.target.value)
+                  }
+                  placeholder="Phone number"
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+            <p className="text-sm font-semibold text-slate-800">
+              Requested items
+            </p>
+
+            {billItems.length === 0 ? (
+              <p className="mt-2 text-xs text-slate-500">
+                No items selected yet.
+              </p>
+            ) : (
+              <div className="mt-2 space-y-2">
+                {billItems.map(({ product, quantity }) => (
+                  <div
+                    key={product.productId}
+                    className="flex items-center justify-between text-sm"
+                  >
+                    <span className="text-slate-700">
+                      {product.name} × {quantity}
+                    </span>
+
+                    <span className="font-semibold text-slate-900">
+                      {money(product.sellingPrice * quantity)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+            <p className="text-sm font-semibold text-slate-800">
+              Bill discount
+            </p>
+
+            {canEditDiscount ? (
+              <>
+                <div className="mt-2 grid gap-2 sm:grid-cols-[140px_1fr]">
+                  <Select
+                    value={discountMode}
+                    onChange={(e) =>
+                      setDiscountMode(
+                        e.target.value as typeof discountMode,
+                      )
+                    }
+                  >
+                    <option value="AMOUNT">
+                      Amount (INR)
+                    </option>
+                    <option value="PERCENT">
+                      Percent (%)
+                    </option>
+                  </Select>
+
+                  <Input
+                    type="number"
+                    min="0"
+                    step={discountMode === 'PERCENT' ? '0.1' : '1'}
+                    value={discountInput}
+                    onChange={(e) =>
+                      setDiscountInput(e.target.value)
+                    }
+                    placeholder={
+                      discountMode === 'PERCENT'
+                        ? 'Enter % discount'
+                        : 'Enter discount amount'
+                    }
+                  />
+                </div>
+
+                <p className="mt-2 text-xs text-slate-500">
+                  Applied discount: {money(saleDiscount)}
+                </p>
+              </>
+            ) : (
+              <p className="mt-2 text-xs text-slate-500">
+                Only the shop owner can edit discount.
+              </p>
+            )}
+          </div>
+
           <Select
+            className="mt-3"
             value={method}
             onChange={(e) => {
               setMethod(
@@ -4374,6 +4622,7 @@ function Pos({
           <PrimaryButton
             className="mt-4 w-full"
             onClick={checkout}
+            disabled={!canCheckout}
           >
             Save {method.toLowerCase()} sale
           </PrimaryButton>
