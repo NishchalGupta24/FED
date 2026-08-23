@@ -46,22 +46,10 @@ async function createSale(shopId: string, payload: any) {
 app.post('/api/sales', async (req, res) => { try { res.status(201).json({ success: true, data: await createSale(req.user!.shopId, req.body) }) } catch (e) { fail(res, 400, (e as any).code || 'SALE_FAILED', (e as Error).message) } })
 app.post('/api/payments', requireRole('OWNER', 'MANAGER', 'STAFF'), async (req, res) => { const transactionId = req.body.transactionId || randomUUID(), shopId = req.user!.shopId, existing = await PaymentModel.findOne({ transactionId }); if (existing) return res.json({ success: true, data: existing }); const payment = await PaymentModel.create({ ...req.body, shopId, paymentId: req.body.paymentId || randomUUID(), transactionId, status: req.body.status || 'SUCCESS', verifiedAt: new Date() }); if (payment.status === 'SUCCESS' && payment.customerId) await LedgerTransactionModel.create({ transactionId: `${transactionId}:ledger`, shopId, customerId: payment.customerId, type: 'PAYMENT', direction: 'CREDIT', amount: payment.amount, referenceId: payment.paymentId, description: 'Customer payment' }); res.status(201).json({ success: true, data: payment }) })
 type NotificationChannel = 'sms' | 'whatsapp' | 'both'
-const asE164 = (phone: string) => {
-  const digits = phone.replace(/\D/g, '')
-  return digits.length === 10 ? `+91${digits}` : phone.trim().startsWith('+') ? `+${digits}` : `+${digits}`
-}
+const asE164 = (phone: string) => { const digits = phone.replace(/\D/g, ''); return digits.length === 10 ? `+91${digits}` : phone.trim().startsWith('+') ? `+${digits}` : `+${digits}` }
 async function sendTextbeeMessage(phone: string, message: string) {
-  const response = await fetch('https://api.textbee.dev/api/v1/gateway/send-sms', {
-    method: 'POST',
-    headers: {
-      'x-api-key': env.textbeeApiKey,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ recipients: [phone], message }),
-  })
-  const body = await response.text()
-  if (!response.ok) throw new Error(`TextBee request failed (${response.status}): ${body}`)
-  return body
+  const response = await fetch('https://api.textbee.dev/api/v1/gateway/send-sms', { method: 'POST', headers: { 'x-api-key': env.textbeeApiKey, 'Content-Type': 'application/json' }, body: JSON.stringify({ recipients: [phone], message }) })
+  const body = await response.text(); if (!response.ok) throw new Error(`TextBee request failed (${response.status}): ${body}`); return body
 }
 app.post('/api/notifications/send', requireRole('OWNER', 'MANAGER', 'STAFF'), async (req, res) => {
   const { phone, message, channel = 'both' } = req.body as { phone?: string; message?: string; channel?: NotificationChannel }
@@ -69,13 +57,7 @@ app.post('/api/notifications/send', requireRole('OWNER', 'MANAGER', 'STAFF'), as
   if (channel !== 'sms') return fail(res, 400, 'WHATSAPP_NOT_SUPPORTED', 'TextBee supports SMS only; use channel "sms"')
   if (!env.textbeeApiKey) return fail(res, 503, 'MESSAGING_NOT_CONFIGURED', 'TextBee messaging is not configured')
   const normalizedPhone = asE164(phone)
-  try {
-    const providerResponse = await sendTextbeeMessage(normalizedPhone, message)
-    console.log(`[notifications] TextBee accepted SMS for ${normalizedPhone}: ${providerResponse}`)
-    res.json({ success: true, data: { phone: normalizedPhone, channels: ['sms'] } })
-  } catch (error) {
-    fail(res, 502, 'MESSAGE_SEND_FAILED', (error as Error).message)
-  }
+  try { const providerResponse = await sendTextbeeMessage(normalizedPhone, message); console.log(`[notifications] TextBee accepted SMS for ${normalizedPhone}: ${providerResponse}`); res.json({ success: true, data: { phone: normalizedPhone, channels: ['sms'] } }) } catch (error) { fail(res, 502, 'MESSAGE_SEND_FAILED', (error as Error).message) }
 })
 app.get('/api/purchase-orders', async (req, res) => res.json({ success: true, data: await PurchaseOrderModel.find(scope(req)) }))
 app.post('/api/purchase-orders', async (req, res) => res.status(201).json({ success: true, data: await PurchaseOrderModel.create({ ...req.body, ...scope(req), purchaseOrderId: req.body.purchaseOrderId || randomUUID(), transactionId: req.body.transactionId || randomUUID() }) }))

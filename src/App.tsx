@@ -119,6 +119,28 @@ export class NotificationService {
 
 export const notificationService = new NotificationService()
 
+type NotificationTemplates = {
+  payment: string
+  credit: string
+}
+
+const defaultNotificationTemplates: NotificationTemplates = {
+  payment: 'Hello {customer}, payment of {amount} received on {date} by {method}. Current credit: {balance}.',
+  credit: 'Hello {customer}, credit of {amount} was given on {date}. Current credit: {balance}.',
+}
+
+const loadNotificationTemplates = (shopId: string): NotificationTemplates => {
+  try {
+    const saved = localStorage.getItem(`dukaansaathi-notification-templates-${shopId}`)
+    return saved ? { ...defaultNotificationTemplates, ...JSON.parse(saved) } : defaultNotificationTemplates
+  } catch {
+    return defaultNotificationTemplates
+  }
+}
+
+const formatNotification = (template: string, values: Record<string, string>) =>
+  template.replace(/\{(customer|amount|balance|date|method|phone)\}/g, (_, key: string) => values[key] || '')
+
 import type {
   Customer,
   LedgerTransaction,
@@ -418,14 +440,31 @@ function Login() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const demo = () => {
-    sessionStore.set({
-      token: 'offline-demo',
-      shopId: 'offline-demo-shop',
-      userId: 'offline-demo-owner',
-      role: 'OWNER',
-      name: 'Demo Owner',
-    })
+  const demo = async () => {
+    setBusy(true)
+    setError('')
+
+    try {
+      sessionStore.set(
+        await api<Session>('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({
+            email: 'demo@dukaansaathi.in',
+            password: 'Password123',
+          }),
+        }),
+      )
+    } catch {
+      sessionStore.set({
+        token: 'offline-demo',
+        shopId: 'offline-demo-shop',
+        userId: 'offline-demo-owner',
+        role: 'OWNER',
+        name: 'Demo Owner',
+      })
+    } finally {
+      setBusy(false)
+    }
 
     nav('/')
   }
@@ -549,9 +588,10 @@ function Login() {
         <SecondaryButton
           type="button"
           onClick={demo}
+          disabled={busy}
           className="mt-3 w-full"
         >
-          Open offline demo
+          {busy ? 'Opening demo…' : 'Open demo'}
         </SecondaryButton>
 
         <div className="mt-6 rounded-xl bg-slate-50 p-3 text-center text-xs text-slate-500">
@@ -596,7 +636,7 @@ function Shop({ session }: { session: Session }) {
   // Seeds the local IndexedDB database when using Offline demo.
   // ---------------------------------------------------------
   const seedDemoData = async () => {
-    if (session.token !== 'offline-demo') return
+    if (session.token !== 'offline-demo' && session.userId !== 'demo-owner') return
 
     // Synchronous, module-level lock. React StrictMode intentionally runs
     // effects twice in development (mount -> cleanup -> mount), which would
@@ -1889,6 +1929,8 @@ function Khata({
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
   const [sales, setSales] = useState<Sale[]>([])
   const [payments, setPayments] = useState<Payment[]>([])
+  const [notificationTemplates, setNotificationTemplates] = useState<NotificationTemplates>(() => loadNotificationTemplates(session.shopId))
+  const [showNotificationSettings, setShowNotificationSettings] = useState(false)
   const [historyCustomerId, setHistoryCustomerId] = useState<
     string | null
   >(null)
@@ -1996,6 +2038,13 @@ function Khata({
       await refresh()
       await loadLedger()
       setSelected(existingCustomer.customerId)
+      if (openingAmount > 0) {
+        try {
+          await notifyCustomer(existingCustomer, notificationTemplates.credit, openingAmount, balanceFor(existingCustomer) + openingAmount, time)
+        } catch (error) {
+          alert(`Credit saved, but SMS was not sent: ${(error as Error).message}`)
+        }
+      }
       return
     }
 
@@ -2041,6 +2090,13 @@ function Khata({
     await loadLedger()
 
     setSelected(customerId)
+    if (openingAmount > 0) {
+      try {
+        await notifyCustomer(customer, notificationTemplates.credit, openingAmount, openingAmount, time)
+      } catch (error) {
+        alert(`Credit saved, but SMS was not sent: ${(error as Error).message}`)
+      }
+    }
   }
 
   const deleteCustomerRecords = async (customer: Customer) => {
@@ -2108,6 +2164,28 @@ function Khata({
   const historyCustomer = customers.find(
     (c) => c.customerId === historyCustomerId,
   )
+
+  const saveNotificationTemplates = (templates: NotificationTemplates) => {
+    setNotificationTemplates(templates)
+    localStorage.setItem(`dukaansaathi-notification-templates-${session.shopId}`, JSON.stringify(templates))
+  }
+
+  const notifyCustomer = async (customer: Customer, template: string, amountValue: number, balance: number, date: string, method?: string) => {
+    const phone = customer.phone?.trim()
+    if (session.token === 'offline-demo' || !phone) return
+    await sendNotification({
+      channel: 'sms',
+      phone,
+      message: formatNotification(template, {
+        customer: customer.name,
+        amount: money(amountValue),
+        balance: money(dueAmount(balance)),
+        date: new Date(date).toLocaleString(),
+        method: method || 'Credit',
+        phone,
+      }),
+    }, session)
+  }
 
   const historyBills = historyCustomer
     ? buildCustomerBills(historyCustomer, sales, ledger, products)
@@ -2244,6 +2322,10 @@ function Khata({
       return
     }
 
+    if (session.token === 'offline-demo') {
+      alert('Payment can be recorded offline, but SMS requires signing in with your online account.')
+    }
+
     const due = balanceFor(selectedCustomer)
 
     if (received > due) {
@@ -2326,19 +2408,24 @@ function Khata({
       },
     )
 
-    const notificationPhone = selectedCustomer.phone?.trim()
-    if (!notificationPhone) {
-      alert('Payment saved, but this customer has no phone number for SMS.')
-    } else {
-      try {
-        await sendNotification({
-          channel: 'sms',
-          phone: notificationPhone,
-          message: `Payment received from ${selectedCustomer.name}: ${money(received)} on ${new Date(time).toLocaleString()}`,
-        }, session)
-        alert('Payment saved and SMS request accepted by TextBee.')
-      } catch (error) {
-        alert(`Payment saved, but SMS was not sent: ${(error as Error).message}`)
+    if (session.token !== 'offline-demo') {
+      const notificationPhone = selectedCustomer.phone?.trim()
+      if (!notificationPhone) {
+        alert('Payment saved, but this customer has no phone number for SMS.')
+      } else {
+        try {
+          await notifyCustomer(
+            selectedCustomer,
+            notificationTemplates.payment,
+            received,
+            due - received,
+            time,
+            paymentMethod,
+          )
+          alert('Payment saved and SMS request accepted by TextBee.')
+        } catch (error) {
+          alert(`Payment saved, but SMS was not sent: ${(error as Error).message}`)
+        }
       }
     }
     setAmount('')
@@ -2350,6 +2437,10 @@ function Khata({
   }
 
   const testSms = async () => {
+    if (session.token === 'offline-demo') {
+      alert('Test SMS requires signing in with your online account. Offline demo mode cannot send SMS.')
+      return
+    }
     if (!selectedCustomer?.phone?.trim()) {
       alert('This customer has no phone number for SMS.')
       return
@@ -2713,6 +2804,38 @@ function Khata({
               </p>
             </div>
           </div>
+
+          <button
+            type="button"
+            className="mt-4 text-left text-sm font-semibold text-emerald-700 hover:text-emerald-800"
+            onClick={() => setShowNotificationSettings((visible) => !visible)}
+          >
+            {showNotificationSettings ? 'Hide SMS message settings' : 'Customize SMS messages'}
+          </button>
+
+          {showNotificationSettings && (
+            <div className="mt-3 space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <label className="block text-xs font-semibold text-slate-600">
+                Payment message
+                <textarea
+                  className="mt-1 min-h-20 w-full rounded-lg border border-slate-200 bg-white p-2 text-sm font-normal text-slate-800 outline-none focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
+                  value={notificationTemplates.payment}
+                  onChange={(event) => saveNotificationTemplates({ ...notificationTemplates, payment: event.target.value })}
+                />
+              </label>
+              <label className="block text-xs font-semibold text-slate-600">
+                Credit message
+                <textarea
+                  className="mt-1 min-h-20 w-full rounded-lg border border-slate-200 bg-white p-2 text-sm font-normal text-slate-800 outline-none focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
+                  value={notificationTemplates.credit}
+                  onChange={(event) => saveNotificationTemplates({ ...notificationTemplates, credit: event.target.value })}
+                />
+              </label>
+              <p className="text-xs text-slate-500">
+                Use: {'{customer}'} {'{amount}'} {'{balance}'} {'{date}'} {'{method}'} {'{phone}'}
+              </p>
+            </div>
+          )}
 
           <Select
             className="mt-5"
