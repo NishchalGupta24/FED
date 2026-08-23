@@ -286,6 +286,11 @@ type Ctx = {
    APP
 ========================================================= */
 
+// Module-level (not component state) so it survives React StrictMode's
+// deliberate double mount/unmount/mount of the App component in development.
+let seedingInFlight = false
+let seedingDone = false
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -489,13 +494,24 @@ function Shop({ session }: { session: Session }) {
   const seedDemoData = async () => {
     if (session.token !== 'offline-demo') return
 
-    const existingProducts = await localDb.products
-      .where('shopId')
-      .equals(session.shopId)
-      .count()
+    // Synchronous, module-level lock. React StrictMode intentionally runs
+    // effects twice in development (mount -> cleanup -> mount), which would
+    // otherwise let two overlapping calls both pass the async "existingProducts"
+    // check below before either had written anything, seeding everything twice.
+    if (seedingInFlight || seedingDone) return
+    seedingInFlight = true
 
-    // Do not overwrite existing shop data.
-    if (existingProducts > 0) return
+    try {
+      const existingProducts = await localDb.products
+        .where('shopId')
+        .equals(session.shopId)
+        .count()
+
+      // Do not overwrite existing shop data.
+      if (existingProducts > 0) {
+        seedingDone = true
+        return
+      }
 
     const time = now()
 
@@ -676,6 +692,9 @@ function Shop({ session }: { session: Session }) {
     const sale1 = makeSale(0, 3)
     const sale2 = makeSale(1, 1)
     const sale3 = makeSale(3, 4, customers[0].customerId)
+    // This is a walk-in credit sale, handed over on the spot — it's already
+    // delivered, just unpaid, so it belongs in Khata, not Pending Deliveries.
+    sale3.deliveredAt = time
 
     await localDb.sales.bulkPut([sale1, sale2, sale3])
 
@@ -852,7 +871,11 @@ function Shop({ session }: { session: Session }) {
       ...deliveryOrder6.items,
     ] as SaleItem[])
 
-    console.log('DukaanSaathi: offline demo data seeded successfully')
+      console.log('DukaanSaathi: offline demo data seeded successfully')
+      seedingDone = true
+    } finally {
+      seedingInFlight = false
+    }
   }
 
   const refresh = async () => {
@@ -2250,9 +2273,9 @@ function Khata({
         </form>
       </Card>
 
-      <div className="grid gap-5 lg:grid-cols-[1fr_420px]">
+      <div className="grid gap-5 lg:grid-cols-[1fr_420px] lg:items-start">
         {/* CUSTOMER LIST */}
-        <div className="space-y-3">
+        <div className="space-y-3 lg:max-h-[calc(100vh-180px)] lg:overflow-y-auto lg:pr-1">
           {customers.length > 0 && (
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="font-bold text-slate-950">
@@ -2459,7 +2482,7 @@ function Khata({
         </div>
 
         {/* PAYMENT + HISTORY */}
-        <Card className="h-fit lg:sticky lg:top-36">
+        <Card className="h-fit lg:sticky lg:top-36 lg:max-h-[calc(100vh-180px)] lg:overflow-y-auto">
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-emerald-50 text-emerald-700">
               ₹
@@ -2919,6 +2942,7 @@ function Pos({
   const [method, setMethod] =
     useState<'CASH' | 'CREDIT' | 'UPI'>('CASH')
   const [showUpi, setShowUpi] = useState(false)
+  const [upiPaymentReceived, setUpiPaymentReceived] = useState(false)
   const [view, setView] = useState<'billing' | 'deliveries'>('billing')
   const [pendingSales, setPendingSales] = useState<Sale[]>([])
   const [saleItems, setSaleItems] = useState<SaleItem[]>([])
@@ -2926,6 +2950,10 @@ function Pos({
     saleId: string
     sale: Sale
   } | null>(null)
+  // Whether the dialog was opened via the "Paid in Full" quick action —
+  // when true, skip the Partial/Not Paid options and just show one
+  // explicit confirm step.
+  const [paymentDialogQuickPaid, setPaymentDialogQuickPaid] = useState(false)
   const [paymentStatus, setPaymentStatus] =
     useState<'PAID' | 'PARTIAL' | 'NOT_PAID'>('NOT_PAID')
   const [amountPaid, setAmountPaid] = useState('')
@@ -2936,24 +2964,13 @@ function Pos({
       .equals(session.shopId)
       .toArray()
 
-    // Get all khata entries to see which orders have been marked as delivered
-    const allLedger = await localDb.ledgerTransactions
-      .where('shopId')
-      .equals(session.shopId)
-      .toArray()
-
-    const deliveredOrderIds = new Set(
-      allLedger
-        .filter((l) => l.description?.includes('Delivery order'))
-        .map((l) => l.referenceId),
-    )
-
+    // Pending Deliveries = orders not yet marked delivered, regardless of
+    // payment status (paid-but-undelivered still belongs here). Once an
+    // order is marked delivered (deliveredAt set), it drops out of this list;
+    // if it was unpaid at that point, handlePaymentConfirm writes a khata
+    // entry so it shows up there instead.
     const pending = sales.filter(
-      (s) =>
-        (s.paymentStatus === 'PENDING' ||
-          s.paymentStatus === 'FAILED') &&
-        s.customerId &&
-        !deliveredOrderIds.has(s.saleId), // Exclude orders already marked as delivered
+      (s) => s.customerId && !s.deliveredAt,
     )
     setPendingSales(pending)
 
@@ -3036,7 +3053,7 @@ function Pos({
         method === 'CREDIT'
           ? 'PENDING'
           : method === 'UPI'
-            ? 'PENDING'
+            ? (upiPaymentReceived ? 'SUCCESS' : 'PENDING')
             : 'SUCCESS',
       transactionId: tid,
       createdAt: time,
@@ -3114,26 +3131,30 @@ function Pos({
 
     setCart({})
     setCustomerId('')
+    setShowUpi(false)
+    setUpiPaymentReceived(false)
 
     await refresh()
 
     alert(`Receipt saved locally: ${money(total)}`)
   }
 
-  const handlePaymentConfirm = async () => {
-    if (!paymentDialog) return
-
-    const { saleId, sale } = paymentDialog
+  const finalizeDelivery = async (
+    sale: Sale,
+    outcome: 'PAID' | 'PARTIAL' | 'NOT_PAID',
+    partialAmountPaid?: string,
+  ) => {
+    const saleId = sale.saleId
     const time = now()
     let newPaymentStatus: PaymentStatus = 'SUCCESS'
     let amountOwed = 0
 
-    if (paymentStatus === 'NOT_PAID') {
+    if (outcome === 'NOT_PAID') {
       newPaymentStatus = 'PENDING'
       amountOwed = sale.total
-    } else if (paymentStatus === 'PARTIAL') {
+    } else if (outcome === 'PARTIAL') {
       newPaymentStatus = 'PENDING'
-      const paid = parseFloat(amountPaid) || 0
+      const paid = parseFloat(partialAmountPaid || '') || 0
       amountOwed = Math.max(0, sale.total - paid)
     } else {
       newPaymentStatus = 'SUCCESS'
@@ -3190,8 +3211,8 @@ function Pos({
           amount: amountOwed,
           referenceId: saleId,
           description:
-            paymentStatus === 'PARTIAL'
-              ? `Delivery order - partial payment (${money(parseFloat(amountPaid) || 0)} paid)`
+            outcome === 'PARTIAL'
+              ? `Delivery order - partial payment (${money(parseFloat(partialAmountPaid || '') || 0)} paid)`
               : 'Delivery order - unpaid',
           createdAt: time,
           updatedAt: time,
@@ -3232,10 +3253,6 @@ function Pos({
       payload: { ...sale, paymentStatus: newPaymentStatus, deliveredAt: time },
     })
 
-    setPaymentDialog(null)
-    setPaymentStatus('NOT_PAID')
-    setAmountPaid('')
-
     // First, remove from state immediately for UI responsiveness
     setPendingSales((prev) =>
       prev.filter((s) => s.saleId !== saleId),
@@ -3255,17 +3272,45 @@ function Pos({
     alert(statusMsg)
   }
 
-  const openPaymentDialog = (sale: Sale) => {
-    setPaymentDialog({ saleId: sale.saleId, sale })
+  const handlePaymentConfirm = async () => {
+    if (!paymentDialog) return
+
+    const { sale } = paymentDialog
+
+    await finalizeDelivery(sale, paymentStatus, amountPaid)
+
+    setPaymentDialog(null)
     setPaymentStatus('NOT_PAID')
     setAmountPaid('')
+    setPaymentDialogQuickPaid(false)
   }
 
-  const markAsDelivered = async (saleId: string) => {
+  const openPaymentDialog = (
+    sale: Sale,
+    initialStatus: 'PAID' | 'PARTIAL' | 'NOT_PAID' = 'NOT_PAID',
+    quickPaid = false,
+  ) => {
+    setPaymentDialog({ saleId: sale.saleId, sale })
+    setPaymentStatus(initialStatus)
+    setAmountPaid('')
+    setPaymentDialogQuickPaid(quickPaid)
+  }
+
+  // Both quick-action buttons open the same confirmation dialog. "Paid in
+  // Full" skips straight to a single confirm step (quickPaid = true);
+  // "Partial / Not Paid" shows the Partial/Not Paid choice.
+  const markAsDeliveredPaidInFull = (saleId: string) => {
     const sale = pendingSales.find((s) => s.saleId === saleId)
     if (!sale) return
 
-    openPaymentDialog(sale)
+    openPaymentDialog(sale, 'PAID', true)
+  }
+
+  const markAsDeliveredPartialOrUnpaid = (saleId: string) => {
+    const sale = pendingSales.find((s) => s.saleId === saleId)
+    if (!sale) return
+
+    openPaymentDialog(sale, 'NOT_PAID', false)
   }
 
   return (
@@ -3285,90 +3330,81 @@ function Pos({
               </p>
             </div>
 
-            <div className="my-5 space-y-3">
-              <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
-                onClick={() => setPaymentStatus('PAID')}
-              >
-                <input
-                  type="radio"
-                  checked={paymentStatus === 'PAID'}
-                  onChange={() => setPaymentStatus('PAID')}
-                  className="cursor-pointer"
-                />
-                <div>
-                  <p className="font-semibold">Paid in Full</p>
-                  <p className="text-xs text-slate-500">
-                    No entry in khata
-                  </p>
+            {paymentDialogQuickPaid ? (
+              <p className="my-5 text-sm text-slate-600">
+                This order will be marked as delivered and paid in full — no khata entry needed.
+              </p>
+            ) : (
+              <>
+                <div className="my-5 space-y-3">
+                  <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
+                    onClick={() => setPaymentStatus('PARTIAL')}
+                  >
+                    <input
+                      type="radio"
+                      checked={paymentStatus === 'PARTIAL'}
+                      onChange={() => setPaymentStatus('PARTIAL')}
+                      className="cursor-pointer"
+                    />
+                    <div>
+                      <p className="font-semibold">Partial Payment</p>
+                      <p className="text-xs text-slate-500">
+                        Enter amount paid
+                      </p>
+                    </div>
+                  </label>
+
+                  <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
+                    onClick={() => setPaymentStatus('NOT_PAID')}
+                  >
+                    <input
+                      type="radio"
+                      checked={paymentStatus === 'NOT_PAID'}
+                      onChange={() => setPaymentStatus('NOT_PAID')}
+                      className="cursor-pointer"
+                    />
+                    <div>
+                      <p className="font-semibold">Not Paid</p>
+                      <p className="text-xs text-slate-500">
+                        Full amount to khata
+                      </p>
+                    </div>
+                  </label>
                 </div>
-              </label>
 
-              <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
-                onClick={() => setPaymentStatus('PARTIAL')}
-              >
-                <input
-                  type="radio"
-                  checked={paymentStatus === 'PARTIAL'}
-                  onChange={() => setPaymentStatus('PARTIAL')}
-                  className="cursor-pointer"
-                />
-                <div>
-                  <p className="font-semibold">Partial Payment</p>
-                  <p className="text-xs text-slate-500">
-                    Enter amount paid
-                  </p>
-                </div>
-              </label>
+                {paymentStatus === 'PARTIAL' && (
+                  <div className="mb-4">
+                    <label className="block text-sm font-semibold text-slate-700">
+                      Amount Paid
+                    </label>
 
-              <label className="flex items-center gap-3 rounded-lg border-2 border-slate-200 p-3 cursor-pointer hover:border-emerald-300"
-                onClick={() => setPaymentStatus('NOT_PAID')}
-              >
-                <input
-                  type="radio"
-                  checked={paymentStatus === 'NOT_PAID'}
-                  onChange={() => setPaymentStatus('NOT_PAID')}
-                  className="cursor-pointer"
-                />
-                <div>
-                  <p className="font-semibold">Not Paid</p>
-                  <p className="text-xs text-slate-500">
-                    Full amount to khata
-                  </p>
-                </div>
-              </label>
-            </div>
+                    <input
+                      type="number"
+                      value={amountPaid}
+                      onChange={(e) =>
+                        setAmountPaid(e.target.value)
+                      }
+                      placeholder="0"
+                      className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2"
+                    />
 
-            {paymentStatus === 'PARTIAL' && (
-              <div className="mb-4">
-                <label className="block text-sm font-semibold text-slate-700">
-                  Amount Paid
-                </label>
-
-                <input
-                  type="number"
-                  value={amountPaid}
-                  onChange={(e) =>
-                    setAmountPaid(e.target.value)
-                  }
-                  placeholder="0"
-                  className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2"
-                />
-
-                {amountPaid && (
-                  <p className="mt-2 text-sm text-slate-600">
-                    Remaining:{' '}
-                    <span className="font-bold">
-                      {money(
-                        Math.max(
-                          0,
-                          paymentDialog.sale.total -
-                            (parseFloat(amountPaid) || 0),
-                        ),
-                      )}
-                    </span>
-                  </p>
+                    {amountPaid && (
+                      <p className="mt-2 text-sm text-slate-600">
+                        Remaining:{' '}
+                        <span className="font-bold">
+                          {money(
+                            Math.max(
+                              0,
+                              paymentDialog.sale.total -
+                                (parseFloat(amountPaid) || 0),
+                            ),
+                          )}
+                        </span>
+                      </p>
+                    )}
+                  </div>
                 )}
-              </div>
+              </>
             )}
 
             <div className="flex gap-3">
@@ -3377,6 +3413,7 @@ function Pos({
                   setPaymentDialog(null)
                   setPaymentStatus('NOT_PAID')
                   setAmountPaid('')
+                  setPaymentDialogQuickPaid(false)
                 }}
                 className="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50"
               >
@@ -3387,7 +3424,7 @@ function Pos({
                 className="flex-1"
                 onClick={handlePaymentConfirm}
               >
-                Confirm
+                Mark as Delivered
               </PrimaryButton>
             </div>
           </Card>
@@ -3586,11 +3623,12 @@ function Pos({
 
           <Select
             value={method}
-            onChange={(e) =>
+            onChange={(e) => {
               setMethod(
                 e.target.value as typeof method,
               )
-            }
+              setUpiPaymentReceived(false)
+            }}
           >
             <option value="CASH">
               Cash
@@ -3657,6 +3695,17 @@ function Pos({
               <small className="mt-2 text-center text-xs text-slate-500">
                 Demo verification only — confirm payment manually.
               </small>
+
+              <label className="mt-3 flex w-full items-center gap-2 rounded-xl border border-emerald-200 bg-white p-3 text-sm font-semibold text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={upiPaymentReceived}
+                  onChange={(e) =>
+                    setUpiPaymentReceived(e.target.checked)
+                  }
+                />
+                I've received the payment
+              </label>
 
             </div>
           )}
@@ -3791,14 +3840,25 @@ function Pos({
                     </div>
                   </div>
 
-                  <PrimaryButton
-                    className="mt-4 w-full"
-                    onClick={() =>
-                      markAsDelivered(sale.saleId)
-                    }
-                  >
-                    Mark as Delivered
-                  </PrimaryButton>
+                  <div className="mt-4 flex gap-2">
+                    <PrimaryButton
+                      className="flex-1"
+                      onClick={() =>
+                        markAsDeliveredPaidInFull(sale.saleId)
+                      }
+                    >
+                      Paid in Full
+                    </PrimaryButton>
+
+                    <button
+                      onClick={() =>
+                        markAsDeliveredPartialOrUnpaid(sale.saleId)
+                      }
+                      className="flex-1 rounded-xl border-2 border-slate-200 p-3 font-semibold text-slate-700 hover:border-emerald-300"
+                    >
+                      Partial / Not Paid
+                    </button>
+                  </div>
                 </Card>
               )
             })
