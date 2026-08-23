@@ -561,14 +561,21 @@ function Shop({ session }: { session: Session }) {
 
     // =========================
     // CUSTOMERS
+    // Mix of payment statuses so Khata looks realistic out of the box:
+    // openingBalance > 0 -> customer owes the shop (pending)
+    // openingBalance = 0 -> starts clean; cleared status below comes from
+    //                       a matching debit/credit pair in the ledger
+    // openingBalance < 0 -> shop owes the customer (advance / overpaid)
     // =========================
     const customerData = [
       ['Rahul Sharma', '9876543210', 1250],
       ['Amit Kumar', '9812345678', 780],
-      ['Priya Singh', '9898765432', 450],
+      ['Priya Singh', '9898765432', 0],
       ['Rohit Gupta', '9765432109', 2100],
-      ['Anjali Verma', '9823456710', 320],
+      ['Anjali Verma', '9823456710', -300],
       ['Vikash Yadav', '9798765432', 650],
+      ['Sneha Reddy', '9845123670', 0],
+      ['Manoj Tiwari', '9871122334', 0],
     ]
 
     const customers: Customer[] = customerData.map(
@@ -690,53 +697,150 @@ function Shop({ session }: { session: Session }) {
       direction: 'DEBIT',
       amount: sale3.total,
       referenceId: sale3.saleId,
-      description: 'Demo credit sale',
+      description: 'Credit sale - groceries',
       createdAt: time,
       updatedAt: time,
     }
 
     await localDb.ledgerTransactions.put(ledgerEntry)
 
+    // Priya Singh (index 2) and Sneha Reddy (index 6): took goods on
+    // credit earlier, then paid it off in full -> nets to a cleared
+    // (zero) balance, with a real history behind it rather than just
+    // an empty customer.
+    const clearedHistory: LedgerTransaction[] = [
+      {
+        id: id(),
+        shopId: session.shopId,
+        transactionId: id(),
+        customerId: customers[2].customerId,
+        type: 'SALE',
+        direction: 'DEBIT',
+        amount: 600,
+        description: 'Credit sale - household items',
+        createdAt: time,
+        updatedAt: time,
+      },
+      {
+        id: id(),
+        shopId: session.shopId,
+        transactionId: id(),
+        customerId: customers[2].customerId,
+        type: 'PAYMENT',
+        direction: 'CREDIT',
+        amount: 600,
+        description: 'Paid in full - cash',
+        createdAt: time,
+        updatedAt: time,
+      },
+      {
+        id: id(),
+        shopId: session.shopId,
+        transactionId: id(),
+        customerId: customers[6].customerId,
+        type: 'SALE',
+        direction: 'DEBIT',
+        amount: 950,
+        description: 'Credit sale - monthly groceries',
+        createdAt: time,
+        updatedAt: time,
+      },
+      {
+        id: id(),
+        shopId: session.shopId,
+        transactionId: id(),
+        customerId: customers[6].customerId,
+        type: 'PAYMENT',
+        direction: 'CREDIT',
+        amount: 950,
+        description: 'Paid in full - UPI',
+        createdAt: time,
+        updatedAt: time,
+      },
+    ]
+
+    await localDb.ledgerTransactions.bulkPut(clearedHistory)
+
+    // Manoj Tiwari (index 7): explicit advance payment on record, so his
+    // negative opening balance shows up as a real transaction in his
+    // Khata history rather than just a starting number.
+    const advanceEntry: LedgerTransaction = {
+      id: id(),
+      shopId: session.shopId,
+      transactionId: id(),
+      customerId: customers[7].customerId,
+      type: 'PAYMENT',
+      direction: 'CREDIT',
+      amount: 450,
+      description: 'Advance payment received',
+      createdAt: time,
+      updatedAt: time,
+    }
+
+    await localDb.ledgerTransactions.put(advanceEntry)
+
     // =========================
     // DEMO PENDING DELIVERY ORDERS
+    // Spread across different customers (not just customers[0]-[3]) so
+    // Pending Deliveries doesn't look repetitive, and Rohit Gupta has two
+    // separate orders waiting, to show what multiple pending orders from
+    // the same customer look like.
     // =========================
     const deliveryOrder1: Sale = makeSale(
       0,
-      5,
-      customers[0].customerId,
+      4,
+      customers[1].customerId, // Amit Kumar
     )
     deliveryOrder1.paymentStatus = 'PENDING'
     deliveryOrder1.paymentMethod = 'CREDIT'
 
     const deliveryOrder2: Sale = makeSale(
       1,
-      2,
-      customers[1].customerId,
+      3,
+      customers[2].customerId, // Priya Singh
     )
     deliveryOrder2.paymentStatus = 'PENDING'
     deliveryOrder2.paymentMethod = 'UPI'
 
     const deliveryOrder3: Sale = makeSale(
-      3,
-      8,
-      customers[2].customerId,
+      2,
+      6,
+      customers[3].customerId, // Rohit Gupta - order 1
     )
     deliveryOrder3.paymentStatus = 'PENDING'
     deliveryOrder3.paymentMethod = 'CREDIT'
 
     const deliveryOrder4: Sale = makeSale(
       4,
-      1,
-      customers[3].customerId,
+      2,
+      customers[3].customerId, // Rohit Gupta - order 2
     )
     deliveryOrder4.paymentStatus = 'PENDING'
     deliveryOrder4.paymentMethod = 'UPI'
+
+    const deliveryOrder5: Sale = makeSale(
+      3,
+      1,
+      customers[4].customerId, // Anjali Verma
+    )
+    deliveryOrder5.paymentStatus = 'PENDING'
+    deliveryOrder5.paymentMethod = 'UPI'
+
+    const deliveryOrder6: Sale = makeSale(
+      0,
+      3,
+      customers[7].customerId, // Manoj Tiwari
+    )
+    deliveryOrder6.paymentStatus = 'PENDING'
+    deliveryOrder6.paymentMethod = 'CREDIT'
 
     await localDb.sales.bulkPut([
       deliveryOrder1,
       deliveryOrder2,
       deliveryOrder3,
       deliveryOrder4,
+      deliveryOrder5,
+      deliveryOrder6,
     ])
 
     await localDb.saleItems.bulkPut([
@@ -744,6 +848,8 @@ function Shop({ session }: { session: Session }) {
       ...deliveryOrder2.items,
       ...deliveryOrder3.items,
       ...deliveryOrder4.items,
+      ...deliveryOrder5.items,
+      ...deliveryOrder6.items,
     ] as SaleItem[])
 
     console.log('DukaanSaathi: offline demo data seeded successfully')
@@ -989,9 +1095,15 @@ function Dashboard({
 
   const today = new Date().toDateString()
 
+  // Use the delivery date for orders that came from Pending Deliveries
+  // (so they land in "today's sales" the day they're actually delivered/
+  // paid, not the day the order was originally placed), and the creation
+  // date for regular walk-in / POS sales.
   const todaySales = sales
     .filter(
-      (s) => new Date(s.createdAt).toDateString() === today,
+      (s) =>
+        new Date(s.deliveredAt || s.createdAt).toDateString() ===
+        today,
     )
     .reduce((n, s) => n + s.total, 0)
 
@@ -1337,15 +1449,16 @@ function Dashboard({
 
                         <p className="mt-2 text-xs text-slate-400">
                           {new Date(
-                            sale.createdAt,
+                            sale.deliveredAt || sale.createdAt,
                           ).toLocaleDateString('en-IN')}{' '}
                           at{' '}
                           {new Date(
-                            sale.createdAt,
+                            sale.deliveredAt || sale.createdAt,
                           ).toLocaleTimeString('en-IN', {
                             hour: '2-digit',
                             minute: '2-digit',
                           })}
+                          {sale.deliveredAt && ' · Delivered'}
                         </p>
                       </div>
 
@@ -3027,10 +3140,13 @@ function Pos({
       amountOwed = 0
     }
 
-    // Update sale with new payment status
+    // Update sale with new payment status and mark it delivered now,
+    // so it counts as one of today's sales regardless of when it was
+    // originally placed.
     await localDb.sales.put({
       ...sale,
       paymentStatus: newPaymentStatus,
+      deliveredAt: time,
       updatedAt: time,
     })
 
@@ -3113,7 +3229,7 @@ function Pos({
       action: 'UPDATE',
       endpoint: '/api/sales',
       method: 'PUT',
-      payload: { ...sale, paymentStatus: newPaymentStatus },
+      payload: { ...sale, paymentStatus: newPaymentStatus, deliveredAt: time },
     })
 
     setPaymentDialog(null)
