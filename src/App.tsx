@@ -139,7 +139,7 @@ const loadNotificationTemplates = (shopId: string): NotificationTemplates => {
 }
 
 const formatNotification = (template: string, values: Record<string, string>) =>
-  template.replace(/\{(customer|amount|balance|date|method|phone)\}/g, (_, key: string) => values[key] || '')
+  template.replace(/\{(customer|amount|balance|date|method|phone|items)\}/g, (_, key: string) => values[key] || '')
 
 import type {
   Customer,
@@ -2832,7 +2832,10 @@ function Khata({
                 />
               </label>
               <p className="text-xs text-slate-500">
-                Use: {'{customer}'} {'{amount}'} {'{balance}'} {'{date}'} {'{method}'} {'{phone}'}
+                Use: {'{customer}'} {'{amount}'} {'{balance}'} {'{date}'} {'{method}'} {'{phone}'} {'{items}'}
+              </p>
+              <p className="text-xs text-slate-500">
+                {'{items}'} lists what was bought (Point of Sale messages only) — added automatically at the end of the message if you don't place it yourself.
               </p>
             </div>
           )}
@@ -3504,6 +3507,11 @@ function Pos({
   refresh,
 }: Ctx) {
   const [cart, setCart] = useState<Record<string, number>>({})
+  // Same SMS templates the Khata page's "Record payment" feature uses,
+  // loaded read-only here so Pos can send the same notifications.
+  const [notificationTemplates] = useState<NotificationTemplates>(() =>
+    loadNotificationTemplates(session.shopId),
+  )
   const [customerId, setCustomerId] = useState('')
   const [captureCustomerDetails, setCaptureCustomerDetails] =
     useState(false)
@@ -3663,7 +3671,6 @@ function Pos({
   const canCheckout = billItems.length > 0
 
   const transactionId = id()
-  )
 
   const upi =
     `upi://pay?pa=saathikirana@upi` +
@@ -3672,7 +3679,109 @@ function Pos({
     `&tn=DukaanSaathi%20sale` +
     `&tr=${transactionId}`
 
-  const checkout = async () => {
+  // Resolves who to text about a sale: prefer the linked customer record
+  // (for Credit/Khata sales, or ones resolved via the walk-in flow below),
+  // falling back to the name/phone captured on the sale itself. Returns
+  // null when there's no customer context at all, so plain walk-in cash
+  // sales don't trigger any SMS handling.
+  const smsTargetFor = (
+    sale: Sale,
+  ): { name: string; phone: string } | null => {
+    const customer = sale.customerId
+      ? customers.find((c) => c.customerId === sale.customerId)
+      : undefined
+
+    const name = customer?.name || sale.customerName
+    const phone = (customer?.phone || sale.customerPhone || '').trim()
+
+    if (!name) return null
+
+    return { name, phone }
+  }
+
+  // "2x Rice, 1x Sugar" — used to fill the {items} placeholder in SMS
+  // templates, or appended automatically if the template doesn't use it.
+  const itemsSummaryFor = (sale: Sale): string =>
+    (sale.items || [])
+      .map((it) => {
+        const product = products.find(
+          (p) => p.productId === it.productId,
+        )
+        return `${it.quantity}x ${product?.name || 'Item'}`
+      })
+      .join(', ')
+
+  // Same behavior as Khata's Record Payment SMS: skip silently when there's
+  // no customer context, note it when offline or missing a phone number,
+  // otherwise send a "payment received" SMS for any amount actually paid
+  // or a "credit given" SMS when nothing was paid — returning a short
+  // suffix to append to the existing save/confirm alert.
+  const sendSaleSms = async (
+    sale: Sale,
+    paidAmount: number,
+    amountOwed: number,
+    time: string,
+    method?: string,
+  ): Promise<string> => {
+    const target = smsTargetFor(sale)
+    if (!target) return ''
+
+    // Offline Demo should use the same SMS flow as a normal signed-in
+    // session. The bill is still saved locally first, and the notification
+    // request is attempted afterwards. This keeps the demo behavior aligned
+    // with Khata while still reporting any SMS-provider failure to the user.
+    if (!target.phone) {
+      return ' No phone number on file for SMS.'
+    }
+
+    try {
+      const template =
+        paidAmount > 0
+          ? notificationTemplates.payment
+          : notificationTemplates.credit
+
+      const amountValue = paidAmount > 0 ? paidAmount : amountOwed
+      const itemsText = itemsSummaryFor(sale)
+
+      const message = formatNotification(template, {
+        customer: target.name,
+        amount: money(amountValue),
+        balance: money(Math.max(0, amountOwed)),
+        date: new Date(time).toLocaleString(),
+        method: method || 'Cash',
+        phone: target.phone,
+        items: itemsText,
+      })
+
+      // If the shop hasn't placed {items} in their template themselves,
+      // still include what was bought by appending it to the message.
+      const finalMessage =
+        itemsText && !template.includes('{items}')
+          ? `${message}\nItems: ${itemsText}`
+          : message
+
+      await sendNotification(
+        {
+          channel: 'sms',
+          phone: target.phone,
+          message: finalMessage,
+        },
+        session,
+      )
+
+      return ' SMS sent to customer.'
+    } catch (error) {
+      return ` SMS was not sent: ${(error as Error).message}`
+    }
+  }
+
+  // deliveryOutcome lets the Current Bill "Paid in Full" / "Partial / Not
+  // Paid" quick-action buttons reuse the same payment-status dialog and
+  // finalizeDelivery logic used in Pending Deliveries, right after the sale
+  // is created, instead of only relying on the payment-method dropdown.
+  const checkout = async (
+    deliveryOutcome?: 'PAID' | 'NOT_PAID',
+  ) => {
     const items = billItems.map((item) => ({
         saleItemId: id(),
         saleId: '',
@@ -3698,9 +3807,71 @@ function Pos({
       return alert('Choose a customer for credit')
     }
 
+    // A non-credit sale marked Partial/Not Paid still needs a customer to
+    // record the unpaid balance against — otherwise the "added to khata"
+    // amount would have nowhere to attach and would silently be lost.
+    if (
+      deliveryOutcome === 'NOT_PAID' &&
+      method !== 'CREDIT' &&
+      (!normalizedCustomerName || !normalizedCustomerPhone)
+    ) {
+      return alert(
+        "Check 'Add to this bill' and enter the customer's name and phone to record a partial/unpaid balance",
+      )
+    }
+
     const time = now()
     const saleId = id()
     const tid = id()
+
+    // Resolve the customer to attach the sale/khata entry to. Credit sales
+    // already have one via the dropdown; for a Partial/Not Paid sale on a
+    // non-credit sale, reuse a matching existing customer (by name + phone)
+    // or create a new one on the fly so the due amount can be tracked.
+    let saleCustomerId: string | undefined =
+      method === 'CREDIT' ? customerId : undefined
+
+    if (deliveryOutcome === 'NOT_PAID' && !saleCustomerId) {
+      const normalizedName = normalizedCustomerName.trim().toLowerCase()
+      const normalizedPhone = normalizedCustomerPhone.replace(/\D/g, '')
+
+      const existingCustomer = customers.find(
+        (c) =>
+          c.name.trim().toLowerCase() === normalizedName &&
+          c.phone.replace(/\D/g, '') === normalizedPhone,
+      )
+
+      if (existingCustomer) {
+        saleCustomerId = existingCustomer.customerId
+      } else {
+        const newCustomerId = id()
+
+        const newCustomer: Customer = {
+          id: newCustomerId,
+          customerId: newCustomerId,
+          shopId: session.shopId,
+          name: normalizedCustomerName,
+          phone: normalizedCustomerPhone,
+          openingBalance: 0,
+          interestEnabled: false,
+          createdAt: time,
+          updatedAt: time,
+        }
+
+        await localDb.customers.put(newCustomer)
+
+        await enqueue({
+          transactionId: id(),
+          entityId: newCustomerId,
+          action: 'CREATE',
+          endpoint: '/api/customers',
+          method: 'POST',
+          payload: newCustomer,
+        })
+
+        saleCustomerId = newCustomerId
+      }
+    }
 
     items.forEach((i) => {
       i.saleId = saleId
@@ -3710,8 +3881,7 @@ function Pos({
       id: saleId,
       saleId,
       shopId: session.shopId,
-      customerId:
-        method === 'CREDIT' ? customerId : undefined,
+      customerId: saleCustomerId,
       customerName:
         captureCustomerDetails && normalizedCustomerName
           ? normalizedCustomerName
@@ -3849,7 +4019,34 @@ function Pos({
 
     await refresh()
 
-    alert(`Receipt saved locally: ${money(finalTotal)}`)
+    if (deliveryOutcome) {
+      // Open the same confirmation dialog Pending Deliveries uses, so the
+      // payment amount, payment method and any khata entry for an unpaid
+      // balance are all handled by the existing finalizeDelivery logic.
+      openPaymentDialog(
+        sale,
+        deliveryOutcome === 'PAID' ? 'PAID' : 'NOT_PAID',
+        deliveryOutcome === 'PAID',
+      )
+      return
+    }
+
+    const paidAmount = sale.paymentStatus === 'SUCCESS' ? finalTotal : 0
+    const amountOwed = sale.paymentStatus === 'SUCCESS' ? 0 : finalTotal
+
+    const smsSuffix = await sendSaleSms(
+      sale,
+      paidAmount,
+      amountOwed,
+      time,
+      method,
+    )
+
+    alert(
+      smsSuffix
+        ? `Receipt saved locally: ${money(finalTotal)}.${smsSuffix}`
+        : `Receipt saved locally: ${money(finalTotal)}`,
+    )
   }
 
   const finalizeDelivery = async (
@@ -4023,7 +4220,15 @@ function Pos({
           ? `Order marked with ${money(amountOwed)} pending - added to khata`
           : 'Order marked as delivered'
 
-    alert(statusMsg)
+    const smsSuffix = await sendSaleSms(
+      sale,
+      paidAmount,
+      amountOwed,
+      time,
+      deliveryPaymentMethod,
+    )
+
+    alert(smsSuffix ? `${statusMsg}.${smsSuffix}` : statusMsg)
   }
 
   const handlePaymentConfirm = async () => {
@@ -4243,7 +4448,7 @@ function Pos({
         <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
 
         {/* PRODUCTS */}
-        <div>
+        <div className="lg:sticky lg:top-36 lg:max-h-[calc(100vh-180px)] lg:overflow-y-auto lg:pr-2">
 
           <div className="mb-3 flex items-center justify-between">
 
@@ -4303,7 +4508,7 @@ function Pos({
         </div>
 
         {/* BILL */}
-        <Card className="h-fit lg:sticky lg:top-36">
+        <Card className="h-fit lg:sticky lg:top-36 lg:max-h-[calc(100vh-180px)] lg:overflow-y-auto">
 
           <div className="flex items-center justify-between">
 
@@ -4621,11 +4826,29 @@ function Pos({
 
           <PrimaryButton
             className="mt-4 w-full"
-            onClick={checkout}
+            onClick={() => checkout()}
             disabled={!canCheckout}
           >
             Save {method.toLowerCase()} sale
           </PrimaryButton>
+
+          <div className="mt-2 flex gap-2">
+            <PrimaryButton
+              className="flex-1"
+              onClick={() => checkout('PAID')}
+              disabled={!canCheckout}
+            >
+              Paid in Full
+            </PrimaryButton>
+
+            <button
+              onClick={() => checkout('NOT_PAID')}
+              disabled={!canCheckout}
+              className="flex-1 rounded-xl border-2 border-slate-200 p-3 font-semibold text-slate-700 hover:border-emerald-300 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Partial / Not Paid
+            </button>
+          </div>
 
         </Card>
 
