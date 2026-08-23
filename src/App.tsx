@@ -12,8 +12,112 @@ import { QRCodeSVG } from 'qrcode.react'
 import { localDb } from './db/localDb'
 import { enqueue } from './sync/outbox'
 import { startSync } from './sync/syncEngine'
-import { api } from './services/api'
+import { api, sendNotification } from './services/api'
 import { sessionStore, type Session } from './services/session'
+
+// Notification types
+export type NotificationType = 'whatsapp' | 'sms' | 'both'
+export type NotificationEvent = 'payment' | 'credit_given' | 'pending_over_limit' | 'new_customer'
+
+export interface NotificationConfig {
+  enabled: boolean
+  type: NotificationType
+  phoneField: 'phone' | 'whatsapp'
+  webhookUrl?: string
+  messageTemplates: {
+    [key in NotificationEvent]: string
+  }
+  pendingLimit: number
+  adminPhone?: string
+}
+
+export interface NotificationRequest {
+  type: NotificationType
+  phone: string
+  message: string
+  event: NotificationEvent
+  metadata?: Record<string, any>
+}
+
+// Notification service
+export class NotificationService {
+  private config: NotificationConfig | null = null
+
+  setConfig(config: NotificationConfig) {
+    this.config = config
+  }
+
+  async sendNotification(request: NotificationRequest): Promise<boolean> {
+    if (!this.config || !this.config.enabled) return false
+
+    if (request.event === 'pending_over_limit' && this.config.pendingLimit) {
+      if (!this.config.adminPhone) return false
+    }
+
+    if (!request.phone) return false
+
+    const message = this.formatMessage(request)
+
+    try {
+      if (this.config.webhookUrl) {
+        await fetch(this.config.webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        })
+      }
+
+      if (request.type === 'whatsapp' || request.type === 'both') {
+        await this.sendWhatsApp(request.phone, message)
+      }
+
+      if (request.type === 'sms' || request.type === 'both') {
+        await this.sendSMS(request.phone, message)
+      }
+
+      return true
+    } catch (error) {
+      console.error('Failed to send notification:', error)
+      return false
+    }
+  }
+
+  private formatMessage(request: NotificationRequest): string {
+    if (this.config?.messageTemplates && this.config.messageTemplates[request.event]) {
+      return this.config.messageTemplates[request.event]
+        .replace('{phone}', request.phone)
+        .replace('{amount}', request.metadata?.amount?.toString() || '')
+        .replace('{customer}', request.metadata?.customerName || '')
+        .replace('{totalDue}', request.metadata?.totalDue?.toString() || '')
+        .replace('{total}', request.metadata?.total?.toString() || '')
+        .replace('{limit}', request.metadata?.limit?.toString() || '')
+        .replace('{name}', request.metadata?.customerName || '')
+        .replace('{date}', request.metadata?.date || new Date().toLocaleString())
+        .replace('{balance}', request.metadata?.balance?.toString() || '')
+    }
+
+    const templates = {
+      payment: 'Payment received from {customer}: ₹{amount!} on {date!}',
+      credit_given: 'Credit given to {customer}: ₹{amount!} on {date!}',
+      pending_over_limit: 'ALERT: {customer} has pending amount ₹{totalDue!} exceeding limit',
+      new_customer: 'New customer {name} added to system. Phone: {phone}.',
+    }
+
+    return templates[request.event] || ''
+  }
+
+  private async sendWhatsApp(phone: string, message: string): Promise<void> {
+    console.log(`Sending WhatsApp to ${phone}: ${message}`)
+    // Implement WhatsApp Business API or external service integration
+  }
+
+  private async sendSMS(phone: string, message: string): Promise<void> {
+    console.log(`Sending SMS to ${phone}: ${message}`)
+    // Implement SMS service integration
+  }
+}
+
+export const notificationService = new NotificationService()
 
 import type {
   Customer,
@@ -1778,9 +1882,13 @@ function Khata({
   const [givenDateTime, setGivenDateTime] = useState('')
   const [selected, setSelected] = useState('')
   const [amount, setAmount] = useState('')
+  const [paymentMethod, setPaymentMethod] = useState<
+    'CASH' | 'UPI' | 'BANK_TRANSFER' | 'CHEQUE'
+  >('CASH')
   const [paymentDateTime, setPaymentDateTime] = useState('')
   const [ledger, setLedger] = useState<LedgerTransaction[]>([])
   const [sales, setSales] = useState<Sale[]>([])
+  const [payments, setPayments] = useState<Payment[]>([])
   const [historyCustomerId, setHistoryCustomerId] = useState<
     string | null
   >(null)
@@ -1814,9 +1922,19 @@ function Khata({
     )
   }
 
+  const loadPayments = async () => {
+    setPayments(
+      await localDb.payments
+        .where('shopId')
+        .equals(session.shopId)
+        .toArray(),
+    )
+  }
+
   useEffect(() => {
     void loadLedger()
     void loadSales()
+    void loadPayments()
   }, [session.shopId, customers])
 
   const add = async (e: FormEvent) => {
@@ -1824,6 +1942,63 @@ function Khata({
 
     const openingAmount = Math.max(0, Number(givenAmount) || 0)
     const time = toIsoOrNow(givenDateTime)
+
+    const normalizedName = name.trim().toLowerCase()
+    const normalizedPhone = phone.replace(/\D/g, '')
+    const storedCustomers = await localDb.customers
+      .where('shopId')
+      .equals(session.shopId)
+      .toArray()
+    const existingCustomer = storedCustomers.find(
+      (customer) =>
+        customer.name.trim().toLowerCase() === normalizedName &&
+        customer.phone.replace(/\D/g, '') === normalizedPhone,
+    )
+
+    if (existingCustomer) {
+      await localDb.transaction(
+        'rw',
+        localDb.customers,
+        localDb.ledgerTransactions,
+        localDb.outbox,
+        async () => {
+          await localDb.customers.put({
+            ...existingCustomer,
+            updatedAt: time,
+            lastTransactionDate: time,
+          })
+
+          if (openingAmount <= 0) return
+
+          const ledgerTransactionId = id()
+          const ledgerEntry: LedgerTransaction = {
+            id: id(),
+            shopId: session.shopId,
+            transactionId: ledgerTransactionId,
+            customerId: existingCustomer.customerId,
+            type: 'ADJUSTMENT',
+            direction: 'DEBIT',
+            amount: openingAmount,
+            description: 'Additional credit given',
+            createdAt: time,
+            updatedAt: time,
+          }
+
+          await localDb.ledgerTransactions.put(ledgerEntry)
+        },
+      )
+
+      setName('')
+      setPhone('')
+      setGivenAmount('')
+      setGivenDateTime('')
+
+      await refresh()
+      await loadLedger()
+      setSelected(existingCustomer.customerId)
+      return
+    }
+
     const customerId = id()
     const transactionId = id()
 
@@ -2107,9 +2282,10 @@ function Khata({
       paymentId: id(),
       shopId: session.shopId,
       customerId: selectedCustomer.customerId,
+      ledgerTransactionId: `${transactionId}:ledger`,
       amount: received,
       status: 'SUCCESS',
-      provider: 'CASH',
+      provider: paymentMethod,
       transactionId,
       verifiedAt: time,
       createdAt: time,
@@ -2125,7 +2301,7 @@ function Khata({
       direction: 'CREDIT',
       amount: received,
       referenceId: payment.paymentId,
-      description: 'Cash payment received',
+      description: `${paymentMethod === 'BANK_TRANSFER' ? 'Bank transfer' : paymentMethod.charAt(0) + paymentMethod.slice(1).toLowerCase()} payment received`,
       createdAt: time,
       updatedAt: time,
     }
@@ -2150,10 +2326,45 @@ function Khata({
       },
     )
 
+    const notificationPhone = selectedCustomer.phone?.trim()
+    if (!notificationPhone) {
+      alert('Payment saved, but this customer has no phone number for SMS.')
+    } else {
+      try {
+        await sendNotification({
+          channel: 'sms',
+          phone: notificationPhone,
+          message: `Payment received from ${selectedCustomer.name}: ${money(received)} on ${new Date(time).toLocaleString()}`,
+        }, session)
+        alert('Payment saved and SMS request accepted by TextBee.')
+      } catch (error) {
+        alert(`Payment saved, but SMS was not sent: ${(error as Error).message}`)
+      }
+    }
     setAmount('')
+    setPaymentMethod('CASH')
     setPaymentDateTime('')
     await refresh()
     await loadLedger()
+    await loadPayments()
+  }
+
+  const testSms = async () => {
+    if (!selectedCustomer?.phone?.trim()) {
+      alert('This customer has no phone number for SMS.')
+      return
+    }
+
+    try {
+      await sendNotification({
+        channel: 'sms',
+        phone: selectedCustomer.phone.trim(),
+        message: `Test SMS from DukaanSaathi for ${selectedCustomer.name}.`,
+      }, session)
+      alert('Test SMS accepted by TextBee. Check the customer phone and TextBee message history.')
+    } catch (error) {
+      alert(`Test SMS failed: ${(error as Error).message}`)
+    }
   }
 
   const customerHistory = selectedCustomer
@@ -2202,6 +2413,10 @@ function Khata({
       balance: runningBalance,
     }
   })
+
+  const paymentHistory = historyWithBalance.filter(
+    (item) => item.direction === 'CREDIT',
+  )
 
   return (
     <div className="space-y-5">
@@ -2583,6 +2798,22 @@ function Khata({
             disabled={!selectedCustomer}
           />
 
+          <Select
+            className="mt-3"
+            value={paymentMethod}
+            onChange={(e) =>
+              setPaymentMethod(
+                e.target.value as typeof paymentMethod,
+              )
+            }
+            disabled={!selectedCustomer}
+          >
+            <option value="CASH">Cash</option>
+            <option value="UPI">UPI</option>
+            <option value="BANK_TRANSFER">Bank transfer</option>
+            <option value="CHEQUE">Cheque</option>
+          </Select>
+
           <div className="mt-3">
             <label className="mb-1 block text-xs font-semibold text-slate-500">
               Date &amp; time (optional)
@@ -2604,16 +2835,73 @@ function Khata({
             onClick={pay}
             disabled={!selectedCustomer}
           >
-            Save cash payment
+            Save {paymentMethod === 'BANK_TRANSFER'
+              ? 'bank transfer'
+              : paymentMethod.toLowerCase()} payment
           </PrimaryButton>
 
-          {/* CUSTOMER HISTORY */}
+          <button
+            type="button"
+            className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => void testSms()}
+            disabled={!selectedCustomer}
+          >
+            Send test SMS
+          </button>
+
+          {/* PAYMENT HISTORY */}
           {selectedCustomer && (
             <div className="mt-7 border-t border-slate-100 pt-5">
+              {(() => {
+                const currentBalance = balanceFor(selectedCustomer)
+                const status =
+                  currentBalance > 0
+                    ? 'Payment due'
+                    : currentBalance < 0
+                      ? 'Advance received'
+                      : 'Account settled'
+
+                return (
+                  <div
+                    className={`mb-5 rounded-xl p-4 ${
+                      currentBalance > 0
+                        ? 'bg-amber-50'
+                        : 'bg-emerald-50'
+                    }`}
+                  >
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      Current status
+                    </p>
+
+                    <div className="mt-1 flex items-center justify-between gap-3">
+                      <span
+                        className={`font-bold ${
+                          currentBalance > 0
+                            ? 'text-amber-800'
+                            : 'text-emerald-800'
+                        }`}
+                      >
+                        {status}
+                      </span>
+
+                      <span
+                        className={`font-bold ${
+                          currentBalance > 0
+                            ? 'text-amber-800'
+                            : 'text-emerald-800'
+                        }`}
+                      >
+                        {money(Math.abs(currentBalance))}
+                      </span>
+                    </div>
+                  </div>
+                )
+              })()}
+
               <div className="mb-3 flex items-center justify-between">
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                    Customer history
+                    Payment history
                   </p>
 
                   <p className="mt-1 text-sm font-bold text-slate-900">
@@ -2622,22 +2910,26 @@ function Khata({
                 </div>
 
                 <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
-                  {historyWithBalance.length}{' '}
-                  entries
+                  {paymentHistory.length} payments
                 </span>
               </div>
 
-              {historyWithBalance.length === 0 ? (
+              {paymentHistory.length === 0 ? (
                 <div className="rounded-xl bg-slate-50 p-4 text-center text-sm text-slate-500">
-                  No transactions yet.
+                  No payments recorded yet.
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {historyWithBalance
+                  {paymentHistory
                     .slice()
                     .reverse()
                     .map((item) => {
                       const balance = item.balance
+                      const payment = payments.find(
+                        (record) =>
+                          record.paymentId === item.id ||
+                          record.ledgerTransactionId === item.id,
+                      )
 
                       return (
                         <div
@@ -2663,6 +2955,10 @@ function Khata({
                                     minute: '2-digit',
                                   },
                                 )}
+                              </p>
+
+                              <p className="mt-1 text-xs font-semibold text-slate-500">
+                                Method: {payment?.provider ?? 'Cash'}
                               </p>
                             </div>
 
@@ -2734,6 +3030,8 @@ function Khata({
         <CustomerHistoryModal
           customer={historyCustomer}
           bills={historyBills}
+          ledger={ledger}
+          payments={payments}
           onClose={() => setHistoryCustomerId(null)}
         />
       )}
@@ -2748,13 +3046,44 @@ function Khata({
 function CustomerHistoryModal({
   customer,
   bills,
+  ledger,
+  payments,
   onClose,
 }: {
   customer: Customer
   bills: CustomerBill[]
+  ledger: LedgerTransaction[]
+  payments: Payment[]
   onClose: () => void
 }) {
   const totalDue = bills.reduce((n, b) => n + b.amountDue, 0)
+  const customerPayments = payments
+    .filter((payment) => payment.customerId === customer.customerId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  const creditHistory = [
+    ...(customer.openingBalance > 0
+      ? [
+          {
+            id: `opening-${customer.customerId}`,
+            description: 'Opening credit given',
+            amount: customer.openingBalance,
+            createdAt: customer.createdAt,
+          },
+        ]
+      : []),
+    ...ledger
+      .filter(
+        (entry) =>
+          entry.customerId === customer.customerId &&
+          entry.direction === 'DEBIT',
+      )
+      .map((entry) => ({
+        id: entry.id,
+        description: entry.description,
+        amount: entry.amount,
+        createdAt: entry.createdAt,
+      })),
+  ].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 
   return (
     <div
@@ -2797,6 +3126,120 @@ function CustomerHistoryModal({
         </div>
 
         <div className="max-h-[70vh] space-y-3 overflow-y-auto p-5">
+          <div className="rounded-2xl border border-amber-100 bg-amber-50 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="font-bold text-amber-900">
+                Credit history
+              </p>
+
+              <span className="text-sm font-semibold text-amber-700">
+                {creditHistory.length} entries
+              </span>
+            </div>
+
+            {creditHistory.length === 0 ? (
+              <p className="mt-2 text-sm text-amber-800">
+                No credit given yet.
+              </p>
+            ) : (
+              <div className="mt-3 space-y-2">
+                {creditHistory.map((credit) => (
+                  <div
+                    key={credit.id}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-white p-3"
+                  >
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">
+                        {credit.description}
+                      </p>
+
+                      <p className="mt-1 text-xs text-slate-500">
+                        {new Date(credit.createdAt).toLocaleString(
+                          'en-IN',
+                          {
+                            day: '2-digit',
+                            month: 'short',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          },
+                        )}
+                      </p>
+                    </div>
+
+                    <p className="font-bold text-amber-700">
+                      {money(credit.amount)}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-2xl border border-emerald-100 bg-emerald-50 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="font-bold text-emerald-900">
+                Payment history
+              </p>
+
+              <span className="text-sm font-semibold text-emerald-700">
+                {customerPayments.length} payments
+              </span>
+            </div>
+
+            {customerPayments.length === 0 ? (
+              <p className="mt-2 text-sm text-emerald-800">
+                No payments recorded yet.
+              </p>
+            ) : (
+              <div className="mt-3 space-y-2">
+                {customerPayments.map((payment) => (
+                  <div
+                    key={payment.paymentId}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-white p-3"
+                  >
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">
+                        {money(payment.amount)} paid
+                      </p>
+
+                      <p className="mt-1 text-xs text-slate-500">
+                        {new Date(payment.createdAt).toLocaleString(
+                          'en-IN',
+                          {
+                            day: '2-digit',
+                            month: 'short',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          },
+                        )}
+                      </p>
+                    </div>
+
+                    <div className="text-right">
+                      <p className="text-xs font-semibold text-slate-500">
+                        {payment.provider === 'BANK_TRANSFER'
+                          ? 'Bank transfer'
+                          : payment.provider}
+                      </p>
+
+                      <p
+                        className={`mt-1 text-xs font-semibold ${
+                          payment.status === 'SUCCESS'
+                            ? 'text-emerald-700'
+                            : 'text-amber-700'
+                        }`}
+                      >
+                        {payment.status}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {bills.length === 0 ? (
             <div className="rounded-xl bg-slate-50 p-6 text-center text-sm text-slate-500">
               No purchase records yet for this customer.
@@ -2957,6 +3400,9 @@ function Pos({
   const [paymentStatus, setPaymentStatus] =
     useState<'PAID' | 'PARTIAL' | 'NOT_PAID'>('NOT_PAID')
   const [amountPaid, setAmountPaid] = useState('')
+  const [deliveryPaymentMethod, setDeliveryPaymentMethod] = useState<
+    'CASH' | 'UPI' | 'BANK_TRANSFER' | 'CHEQUE'
+  >('CASH')
 
   const loadPendingSales = async () => {
     const sales = await localDb.sales
@@ -3060,6 +3506,23 @@ function Pos({
       updatedAt: time,
     }
 
+    const salePayment =
+      sale.paymentStatus === 'SUCCESS' && method !== 'CREDIT'
+        ? ({
+            id: id(),
+            paymentId: id(),
+            shopId: session.shopId,
+            saleId,
+            amount: total,
+            status: 'SUCCESS',
+            provider: method,
+            transactionId: `${tid}:payment`,
+            verifiedAt: time,
+            createdAt: time,
+            updatedAt: time,
+          } satisfies Payment)
+        : null
+
     await localDb.transaction(
       'rw',
       [
@@ -3068,6 +3531,7 @@ function Pos({
         localDb.products,
         localDb.stockMovements,
         localDb.ledgerTransactions,
+        localDb.payments,
         localDb.outbox,
       ],
       async () => {
@@ -3118,6 +3582,19 @@ function Pos({
           })
         }
 
+        if (salePayment) {
+          await localDb.payments.put(salePayment)
+
+          await enqueue({
+            transactionId: salePayment.transactionId,
+            entityId: salePayment.paymentId,
+            action: 'CREATE',
+            endpoint: '/api/payments',
+            method: 'POST',
+            payload: salePayment,
+          })
+        }
+
         await enqueue({
           transactionId: tid,
           entityId: saleId,
@@ -3161,6 +3638,34 @@ function Pos({
       amountOwed = 0
     }
 
+    const paidAmount =
+      outcome === 'PAID'
+        ? sale.total
+        : outcome === 'PARTIAL'
+          ? Math.min(
+              sale.total,
+              Math.max(0, parseFloat(partialAmountPaid || '') || 0),
+            )
+          : 0
+
+    const payment =
+      paidAmount > 0
+        ? ({
+            id: id(),
+            paymentId: id(),
+            shopId: session.shopId,
+            saleId,
+            customerId: sale.customerId,
+            amount: paidAmount,
+            status: 'SUCCESS',
+            provider: deliveryPaymentMethod,
+            transactionId: `${sale.transactionId}:payment:${id()}`,
+            verifiedAt: time,
+            createdAt: time,
+            updatedAt: time,
+          } satisfies Payment)
+        : null
+
     // Update sale with new payment status and mark it delivered now,
     // so it counts as one of today's sales regardless of when it was
     // originally placed.
@@ -3170,6 +3675,19 @@ function Pos({
       deliveredAt: time,
       updatedAt: time,
     })
+
+    if (payment) {
+      await localDb.payments.put(payment)
+
+      await enqueue({
+        transactionId: payment.transactionId,
+        entityId: payment.paymentId,
+        action: 'CREATE',
+        endpoint: '/api/payments',
+        method: 'POST',
+        payload: payment,
+      })
+    }
 
     // If customer and amount owed, add/update khata
     if (sale.customerId && amountOwed > 0) {
@@ -3282,6 +3800,7 @@ function Pos({
     setPaymentDialog(null)
     setPaymentStatus('NOT_PAID')
     setAmountPaid('')
+    setDeliveryPaymentMethod('CASH')
     setPaymentDialogQuickPaid(false)
   }
 
@@ -3293,6 +3812,7 @@ function Pos({
     setPaymentDialog({ saleId: sale.saleId, sale })
     setPaymentStatus(initialStatus)
     setAmountPaid('')
+    setDeliveryPaymentMethod('CASH')
     setPaymentDialogQuickPaid(quickPaid)
   }
 
@@ -3404,6 +3924,23 @@ function Pos({
                     )}
                   </div>
                 )}
+
+                {(paymentStatus === 'PARTIAL' || paymentStatus === 'PAID') && (
+                  <Select
+                    className="mb-4"
+                    value={deliveryPaymentMethod}
+                    onChange={(e) =>
+                      setDeliveryPaymentMethod(
+                        e.target.value as typeof deliveryPaymentMethod,
+                      )
+                    }
+                  >
+                    <option value="CASH">Cash</option>
+                    <option value="UPI">UPI</option>
+                    <option value="BANK_TRANSFER">Bank transfer</option>
+                    <option value="CHEQUE">Cheque</option>
+                  </Select>
+                )}
               </>
             )}
 
@@ -3413,6 +3950,7 @@ function Pos({
                   setPaymentDialog(null)
                   setPaymentStatus('NOT_PAID')
                   setAmountPaid('')
+                  setDeliveryPaymentMethod('CASH')
                   setPaymentDialogQuickPaid(false)
                 }}
                 className="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50"

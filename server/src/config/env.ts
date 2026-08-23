@@ -5,4 +5,5 @@ export const env = {
   mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/dukaansaathi',
   jwtSecret: process.env.JWT_SECRET || 'development-only-change-me',
   nodeEnv: process.env.NODE_ENV || 'development',
+  textbeeApiKey: process.env.TEXTBEE_API_KEY || '',
 }
