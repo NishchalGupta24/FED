@@ -417,6 +417,10 @@ type Ctx = {
 let seedingInFlight = false
 let seedingDone = false
 
+// Same StrictMode-safe lock pattern as seeding, for the pull-on-login step.
+let pullInFlight = false
+let pullDone = false
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -435,14 +439,27 @@ export default function App() {
 function Login() {
   const nav = useNavigate()
 
-  const [email, setEmail] = useState('demo@dukaansaathi.in')
-  const [password, setPassword] = useState('Password123')
-  const [error, setError] = useState('')
+  const [screen, setScreen] = useState<
+    'landing' | 'choose' | 'signup' | 'login'
+  >('landing')
+
   const [busy, setBusy] = useState(false)
+
+  // --- Sign Up fields ---
+  const [shopName, setShopName] = useState('')
+  const [suEmail, setSuEmail] = useState('')
+  const [suPhone, setSuPhone] = useState('')
+  const [suPassword, setSuPassword] = useState('')
+  const [suConfirmPassword, setSuConfirmPassword] = useState('')
+  const [suError, setSuError] = useState('')
+
+  // --- Log In fields ---
+  const [identifier, setIdentifier] = useState('')
+  const [liPassword, setLiPassword] = useState('')
+  const [liError, setLiError] = useState('')
 
   const demo = async () => {
     setBusy(true)
-    setError('')
 
     try {
       sessionStore.set(
@@ -469,33 +486,122 @@ function Login() {
     nav('/')
   }
 
-  const submit = async (e: FormEvent) => {
+  const signUp = async (e: FormEvent) => {
     e.preventDefault()
+    setSuError('')
+
+    // 1. Validate the information
+    if (
+      !shopName.trim() ||
+      !suEmail.trim() ||
+      !suPhone.trim() ||
+      !suPassword ||
+      !suConfirmPassword
+    ) {
+      setSuError('Please fill in every field.')
+      return
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(suEmail.trim())) {
+      setSuError('Enter a valid email address.')
+      return
+    }
+
+    const phoneDigits = suPhone.replace(/\D/g, '')
+
+    if (phoneDigits.length < 10) {
+      setSuError('Enter a valid 10-digit phone number.')
+      return
+    }
+
+    if (suPassword.length < 6) {
+      setSuError('Password must be at least 6 characters.')
+      return
+    }
+
+    if (suPassword !== suConfirmPassword) {
+      setSuError('Passwords do not match.')
+      return
+    }
 
     setBusy(true)
-    setError('')
 
     try {
+      // 2. Uniqueness (email/phone already registered), 3. hashing, and
+      // 4. account creation all happen server-side in /api/auth/register.
       sessionStore.set(
-        await api<Session>('/api/auth/login', {
+        await api<Session>('/api/auth/register', {
           method: 'POST',
           body: JSON.stringify({
-            email,
-            password,
+            name: shopName.trim(),
+            shopName: shopName.trim(),
+            email: suEmail.trim(),
+            phone: phoneDigits,
+            password: suPassword,
           }),
         }),
       )
 
+      // 5 & 6. Register already returns a session (logged in), so just
+      // navigate to the shop dashboard.
       nav('/')
     } catch (e) {
-      setError(
-        e instanceof Error
-          ? `${e.message}. You can still use Offline demo.`
-          : 'Sign in failed',
+      setSuError(
+        e instanceof Error ? e.message : 'Could not create your account.',
       )
     } finally {
       setBusy(false)
     }
+  }
+
+  const logIn = async (e: FormEvent) => {
+    e.preventDefault()
+    setLiError('')
+
+    const value = identifier.trim()
+
+    if (!value || !liPassword) {
+      setLiError('Enter your email or phone number and password.')
+      return
+    }
+
+    const isEmail = value.includes('@')
+
+    setBusy(true)
+
+    try {
+      // 1 & 2. Finding the account (by email or phone) and verifying the
+      // password happen server-side in /api/auth/login.
+      sessionStore.set(
+        await api<Session>('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify(
+            isEmail
+              ? { email: value, password: liPassword }
+              : { phone: value.replace(/\D/g, ''), password: liPassword },
+          ),
+        }),
+      )
+
+      // 3 & 4. Session/token is created by the server; navigate to the
+      // dashboard now that it's stored.
+      nav('/')
+    } catch (e) {
+      // 5. Show an error if the credentials are incorrect.
+      setLiError(
+        e instanceof Error
+          ? e.message
+          : 'Email/phone or password is incorrect.',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const backToLanding = () => {
+    setScreen('landing')
+    setSuError('')
+    setLiError('')
   }
 
   return (
@@ -507,10 +613,7 @@ function Login() {
         <div className="absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-teal-400/10 blur-3xl" />
       </div>
 
-      <form
-        onSubmit={submit}
-        className="relative w-full max-w-md overflow-hidden rounded-3xl border border-white/10 bg-white p-8 shadow-2xl"
-      >
+      <div className="relative w-full max-w-md overflow-hidden rounded-3xl border border-white/10 bg-white p-8 shadow-2xl">
 
         {/* Brand */}
         <div className="flex items-center gap-3">
@@ -533,7 +636,7 @@ function Login() {
 
         <div className="mt-8">
           <p className="text-sm font-semibold text-emerald-700">
-            WELCOME BACK
+            WELCOME
           </p>
 
           <h1 className="mt-2 text-4xl font-bold tracking-tight text-slate-950">
@@ -548,61 +651,215 @@ function Login() {
           </p>
         </div>
 
-        <label className="mt-7 block text-sm font-medium text-slate-700">
-          Email
+        {screen === 'landing' && (
+          <div className="mt-8">
+            <PrimaryButton
+              type="button"
+              className="w-full"
+              onClick={() => setScreen('choose')}
+              disabled={busy}
+            >
+              Create Account
+            </PrimaryButton>
 
-          <Input
-            className="mt-2"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            type="email"
-            required
-          />
-        </label>
+            <SecondaryButton
+              type="button"
+              onClick={demo}
+              disabled={busy}
+              className="mt-3 w-full"
+            >
+              {busy ? 'Opening demo…' : 'Open demo'}
+            </SecondaryButton>
 
-        <label className="mt-4 block text-sm font-medium text-slate-700">
-          Password
-
-          <Input
-            className="mt-2"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            type="password"
-            required
-          />
-        </label>
-
-        {error && (
-          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-            {error}
+            <div className="mt-6 rounded-xl bg-slate-50 p-3 text-center text-xs text-slate-500">
+              Demo account
+              <br />
+              <span className="font-medium text-slate-700">
+                demo@dukaansaathi.in / Password123
+              </span>
+            </div>
           </div>
         )}
 
-        <PrimaryButton
-          className="mt-6 w-full"
-          disabled={busy}
-        >
-          {busy ? 'Signing in…' : 'Sign in'}
-        </PrimaryButton>
+        {screen === 'choose' && (
+          <div className="mt-8">
+            <PrimaryButton
+              type="button"
+              className="w-full"
+              onClick={() => setScreen('signup')}
+              disabled={busy}
+            >
+              Sign Up
+            </PrimaryButton>
 
-        <SecondaryButton
-          type="button"
-          onClick={demo}
-          disabled={busy}
-          className="mt-3 w-full"
-        >
-          {busy ? 'Opening demo…' : 'Open demo'}
-        </SecondaryButton>
+            <SecondaryButton
+              type="button"
+              onClick={() => setScreen('login')}
+              disabled={busy}
+              className="mt-3 w-full"
+            >
+              Log In
+            </SecondaryButton>
 
-        <div className="mt-6 rounded-xl bg-slate-50 p-3 text-center text-xs text-slate-500">
-          Demo account
-          <br />
-          <span className="font-medium text-slate-700">
-            demo@dukaansaathi.in / Password123
-          </span>
-        </div>
+            <button
+              type="button"
+              onClick={backToLanding}
+              className="mt-5 w-full text-center text-sm font-medium text-slate-500 hover:text-slate-700"
+            >
+              ← Back
+            </button>
+          </div>
+        )}
 
-      </form>
+        {screen === 'signup' && (
+          <form onSubmit={signUp} className="mt-8">
+            <label className="block text-sm font-medium text-slate-700">
+              Shop Name
+
+              <Input
+                className="mt-2"
+                value={shopName}
+                onChange={(e) => setShopName(e.target.value)}
+                required
+              />
+            </label>
+
+            <label className="mt-4 block text-sm font-medium text-slate-700">
+              Email Address
+
+              <Input
+                className="mt-2"
+                value={suEmail}
+                onChange={(e) => setSuEmail(e.target.value)}
+                type="email"
+                required
+              />
+            </label>
+
+            <label className="mt-4 block text-sm font-medium text-slate-700">
+              Phone Number
+
+              <Input
+                className="mt-2"
+                value={suPhone}
+                onChange={(e) => setSuPhone(e.target.value)}
+                type="tel"
+                required
+              />
+            </label>
+
+            <label className="mt-4 block text-sm font-medium text-slate-700">
+              Create Password
+
+              <Input
+                className="mt-2"
+                value={suPassword}
+                onChange={(e) => setSuPassword(e.target.value)}
+                type="password"
+                required
+              />
+            </label>
+
+            <label className="mt-4 block text-sm font-medium text-slate-700">
+              Confirm Password
+
+              <Input
+                className="mt-2"
+                value={suConfirmPassword}
+                onChange={(e) => setSuConfirmPassword(e.target.value)}
+                type="password"
+                required
+              />
+            </label>
+
+            {suError && (
+              <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                {suError}
+              </div>
+            )}
+
+            <PrimaryButton className="mt-6 w-full" disabled={busy}>
+              {busy ? 'Creating account…' : 'Sign Up'}
+            </PrimaryButton>
+
+            <button
+              type="button"
+              onClick={() => {
+                setSuError('')
+                setScreen('login')
+              }}
+              className="mt-4 w-full text-center text-sm font-medium text-emerald-700 hover:text-emerald-800"
+            >
+              Already have an account? Log In
+            </button>
+
+            <button
+              type="button"
+              onClick={backToLanding}
+              className="mt-3 w-full text-center text-sm font-medium text-slate-500 hover:text-slate-700"
+            >
+              ← Back
+            </button>
+          </form>
+        )}
+
+        {screen === 'login' && (
+          <form onSubmit={logIn} className="mt-8">
+            <label className="block text-sm font-medium text-slate-700">
+              Email or Phone Number
+
+              <Input
+                className="mt-2"
+                value={identifier}
+                onChange={(e) => setIdentifier(e.target.value)}
+                required
+              />
+            </label>
+
+            <label className="mt-4 block text-sm font-medium text-slate-700">
+              Password
+
+              <Input
+                className="mt-2"
+                value={liPassword}
+                onChange={(e) => setLiPassword(e.target.value)}
+                type="password"
+                required
+              />
+            </label>
+
+            {liError && (
+              <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                {liError}
+              </div>
+            )}
+
+            <PrimaryButton className="mt-6 w-full" disabled={busy}>
+              {busy ? 'Signing in…' : 'Log In'}
+            </PrimaryButton>
+
+            <button
+              type="button"
+              onClick={() => {
+                setLiError('')
+                setScreen('signup')
+              }}
+              className="mt-4 w-full text-center text-sm font-medium text-emerald-700 hover:text-emerald-800"
+            >
+              New here? Sign Up
+            </button>
+
+            <button
+              type="button"
+              onClick={backToLanding}
+              className="mt-3 w-full text-center text-sm font-medium text-slate-500 hover:text-slate-700"
+            >
+              ← Back
+            </button>
+          </form>
+        )}
+
+      </div>
     </main>
   )
 }
@@ -630,6 +887,110 @@ function Shop({ session }: { session: Session }) {
   const [customers, setCustomers] = useState<Customer[]>([])
   const [pending, setPending] = useState(0)
   const [online, setOnline] = useState(navigator.onLine)
+
+  // ---------------------------------------------------------
+  // PULL ON LOGIN
+  // Hydrates the local IndexedDB database from the server the first time
+  // a real (non-offline-demo) account is used on this device/browser.
+  // Without this, a brand-new device would show an empty dashboard after
+  // logging into an existing account, even though the data safely exists
+  // on the server (only local writes ever get read from, elsewhere in the
+  // app). Guarded to run only once, and only when this device has no local
+  // records yet for this shop, so it never overwrites anything already
+  // saved locally (including edits still waiting in the outbox).
+  // ---------------------------------------------------------
+  const pullFromServer = async () => {
+    if (session.token === 'offline-demo') return
+    if (pullInFlight || pullDone) return
+    pullInFlight = true
+
+    try {
+      const existingCustomers = await localDb.customers
+        .where('shopId')
+        .equals(session.shopId)
+        .count()
+
+      const existingProducts = await localDb.products
+        .where('shopId')
+        .equals(session.shopId)
+        .count()
+
+      if (existingCustomers > 0 || existingProducts > 0) {
+        pullDone = true
+        return
+      }
+
+      const [
+        pulledCustomers,
+        pulledProducts,
+        pulledSuppliers,
+        pulledPurchaseOrders,
+        pulledSales,
+        pulledLedgerTransactions,
+        pulledPayments,
+      ] = await Promise.all([
+        api<Customer[]>('/api/customers', {}, session),
+        api<Product[]>('/api/products', {}, session),
+        api<Supplier[]>('/api/suppliers', {}, session),
+        api<PurchaseOrder[]>('/api/purchase-orders', {}, session),
+        api<Sale[]>('/api/sales', {}, session),
+        api<LedgerTransaction[]>('/api/ledger', {}, session),
+        api<Payment[]>('/api/payments', {}, session),
+      ])
+
+      await localDb.customers.bulkPut(
+        pulledCustomers.map((c) => ({ ...c, id: c.customerId })),
+      )
+
+      await localDb.products.bulkPut(
+        pulledProducts.map((p) => ({ ...p, id: p.productId })),
+      )
+
+      await localDb.suppliers.bulkPut(
+        pulledSuppliers.map((s) => ({ ...s, id: s.supplierId })),
+      )
+
+      await localDb.purchaseOrders.bulkPut(
+        pulledPurchaseOrders.map((po) => ({
+          ...po,
+          id: po.purchaseOrderId,
+        })),
+      )
+
+      await localDb.sales.bulkPut(
+        pulledSales.map((s) => ({ ...s, id: s.saleId })),
+      )
+
+      // Sale items are embedded on each sale document server-side, already
+      // carrying their own saleItemId/saleId from when they were created.
+      await localDb.saleItems.bulkPut(
+        pulledSales.flatMap((s) => s.items || []),
+      )
+
+      await localDb.ledgerTransactions.bulkPut(
+        pulledLedgerTransactions.map((l) => ({
+          ...l,
+          id: l.transactionId,
+        })),
+      )
+
+      await localDb.payments.bulkPut(
+        pulledPayments.map((p) => ({ ...p, id: p.paymentId })),
+      )
+
+      console.log('DukaanSaathi: pulled existing shop data from server')
+      pullDone = true
+    } catch (error) {
+      // If this failed (e.g. briefly offline right after logging in),
+      // leave pullDone unset so the next mount/refresh can retry.
+      console.error(
+        'DukaanSaathi: could not pull shop data from server',
+        error,
+      )
+    } finally {
+      pullInFlight = false
+    }
+  }
 
   // ---------------------------------------------------------
   // OFFLINE DEMO DATA
@@ -1047,6 +1408,7 @@ function Shop({ session }: { session: Session }) {
 
   useEffect(() => {
     void seedDemoData().then(refresh)
+    void pullFromServer().then(refresh)
 
     const on = () => {
       setOnline(true)
@@ -2172,18 +2534,29 @@ function Khata({
 
   const notifyCustomer = async (customer: Customer, template: string, amountValue: number, balance: number, date: string, method?: string) => {
     const phone = customer.phone?.trim()
-    if (session.token === 'offline-demo' || !phone) return
+    if (!phone) return
+
+    const message = formatNotification(template, {
+      customer: customer.name,
+      amount: money(amountValue),
+      balance: money(dueAmount(balance)),
+      date: new Date(date).toLocaleString(),
+      method: method || 'Credit',
+      phone,
+    })
+
+    if (session.token === 'offline-demo') {
+      // There is no reachable server in this mode (the demo login already
+      // failed before we got here), so a real send would always fail.
+      // Simulate it instead so the feature is still testable end-to-end.
+      console.log(`[Offline demo SMS] To ${phone}: ${message}`)
+      return
+    }
+
     await sendNotification({
       channel: 'sms',
       phone,
-      message: formatNotification(template, {
-        customer: customer.name,
-        amount: money(amountValue),
-        balance: money(dueAmount(balance)),
-        date: new Date(date).toLocaleString(),
-        method: method || 'Credit',
-        phone,
-      }),
+      message,
     }, session)
   }
 
@@ -2322,10 +2695,6 @@ function Khata({
       return
     }
 
-    if (session.token === 'offline-demo') {
-      alert('Payment can be recorded offline, but SMS requires signing in with your online account.')
-    }
-
     const due = balanceFor(selectedCustomer)
 
     if (received > due) {
@@ -2408,24 +2777,26 @@ function Khata({
       },
     )
 
-    if (session.token !== 'offline-demo') {
-      const notificationPhone = selectedCustomer.phone?.trim()
-      if (!notificationPhone) {
-        alert('Payment saved, but this customer has no phone number for SMS.')
-      } else {
-        try {
-          await notifyCustomer(
-            selectedCustomer,
-            notificationTemplates.payment,
-            received,
-            due - received,
-            time,
-            paymentMethod,
-          )
-          alert('Payment saved and SMS request accepted by TextBee.')
-        } catch (error) {
-          alert(`Payment saved, but SMS was not sent: ${(error as Error).message}`)
-        }
+    const notificationPhone = selectedCustomer.phone?.trim()
+    if (!notificationPhone) {
+      alert('Payment saved, but this customer has no phone number for SMS.')
+    } else {
+      try {
+        await notifyCustomer(
+          selectedCustomer,
+          notificationTemplates.payment,
+          received,
+          due - received,
+          time,
+          paymentMethod,
+        )
+        alert(
+          session.token === 'offline-demo'
+            ? 'Payment saved. SMS sent (offline demo — see browser console).'
+            : 'Payment saved and SMS request accepted by TextBee.',
+        )
+      } catch (error) {
+        alert(`Payment saved, but SMS was not sent: ${(error as Error).message}`)
       }
     }
     setAmount('')
@@ -2437,20 +2808,26 @@ function Khata({
   }
 
   const testSms = async () => {
-    if (session.token === 'offline-demo') {
-      alert('Test SMS requires signing in with your online account. Offline demo mode cannot send SMS.')
-      return
-    }
     if (!selectedCustomer?.phone?.trim()) {
       alert('This customer has no phone number for SMS.')
+      return
+    }
+
+    const phone = selectedCustomer.phone.trim()
+    const message = `Test SMS from DukaanSaathi for ${selectedCustomer.name}.`
+
+    if (session.token === 'offline-demo') {
+      // No reachable server in this mode, so simulate the send.
+      console.log(`[Offline demo SMS] To ${phone}: ${message}`)
+      alert('Test SMS sent (offline demo — see browser console).')
       return
     }
 
     try {
       await sendNotification({
         channel: 'sms',
-        phone: selectedCustomer.phone.trim(),
-        message: `Test SMS from DukaanSaathi for ${selectedCustomer.name}.`,
+        phone,
+        message,
       }, session)
       alert('Test SMS accepted by TextBee. Check the customer phone and TextBee message history.')
     } catch (error) {
@@ -3726,40 +4103,44 @@ function Pos({
     const target = smsTargetFor(sale)
     if (!target) return ''
 
-    // Offline Demo should use the same SMS flow as a normal signed-in
-    // session. The bill is still saved locally first, and the notification
-    // request is attempted afterwards. This keeps the demo behavior aligned
-    // with Khata while still reporting any SMS-provider failure to the user.
     if (!target.phone) {
       return ' No phone number on file for SMS.'
     }
 
+    const template =
+      paidAmount > 0
+        ? notificationTemplates.payment
+        : notificationTemplates.credit
+
+    const amountValue = paidAmount > 0 ? paidAmount : amountOwed
+    const itemsText = itemsSummaryFor(sale)
+
+    const message = formatNotification(template, {
+      customer: target.name,
+      amount: money(amountValue),
+      balance: money(Math.max(0, amountOwed)),
+      date: new Date(time).toLocaleString(),
+      method: method || 'Cash',
+      phone: target.phone,
+      items: itemsText,
+    })
+
+    // If the shop hasn't placed {items} in their template themselves,
+    // still include what was bought by appending it to the message.
+    const finalMessage =
+      itemsText && !template.includes('{items}')
+        ? `${message}\nItems: ${itemsText}`
+        : message
+
+    if (session.token === 'offline-demo') {
+      // There is no reachable server in this mode (the demo login already
+      // failed before we got here), so a real send would always fail.
+      // Simulate it instead so the feature is still testable end-to-end.
+      console.log(`[Offline demo SMS] To ${target.phone}: ${finalMessage}`)
+      return ' SMS sent (offline demo — see browser console).'
+    }
+
     try {
-      const template =
-        paidAmount > 0
-          ? notificationTemplates.payment
-          : notificationTemplates.credit
-
-      const amountValue = paidAmount > 0 ? paidAmount : amountOwed
-      const itemsText = itemsSummaryFor(sale)
-
-      const message = formatNotification(template, {
-        customer: target.name,
-        amount: money(amountValue),
-        balance: money(Math.max(0, amountOwed)),
-        date: new Date(time).toLocaleString(),
-        method: method || 'Cash',
-        phone: target.phone,
-        items: itemsText,
-      })
-
-      // If the shop hasn't placed {items} in their template themselves,
-      // still include what was bought by appending it to the message.
-      const finalMessage =
-        itemsText && !template.includes('{items}')
-          ? `${message}\nItems: ${itemsText}`
-          : message
-
       await sendNotification(
         {
           channel: 'sms',
