@@ -471,7 +471,17 @@ function Login() {
           }),
         }),
       )
-    } catch {
+    } catch (error) {
+      // Surface why the real demo login failed instead of silently
+      // dropping into the offline-only fallback — this is the most common
+      // reason SMS (or anything server-backed) doesn't actually work from
+      // the demo button even when a server is running.
+      console.warn(
+        'DukaanSaathi: demo login failed, falling back to offline-only demo mode.',
+        'No SMS or server-backed features will work until this is fixed:',
+        error,
+      )
+
       sessionStore.set({
         token: 'offline-demo',
         shopId: 'offline-demo-shop',
