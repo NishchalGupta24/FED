@@ -3929,6 +3929,18 @@ function Pos({
     'CASH' | 'UPI' | 'BANK_TRANSFER' | 'CHEQUE'
   >('CASH')
 
+  // Current Bill's "Paid in Full" / "Partial / Not Paid" quick actions both
+  // require a customer to be attached to the bill. When one is clicked and
+  // the bill has no customer details yet, we stash which action was
+  // requested here and show a modal to collect them; once saved, checkout()
+  // is re-run automatically with the same outcome.
+  const [showCustomerRequiredModal, setShowCustomerRequiredModal] =
+    useState(false)
+  const [pendingDeliveryOutcome, setPendingDeliveryOutcome] = useState<
+    'PAID' | 'NOT_PAID' | null
+  >(null)
+  const [customerModalError, setCustomerModalError] = useState('')
+
   const loadPendingSales = async () => {
     const sales = await localDb.sales
       .where('shopId')
@@ -4198,17 +4210,27 @@ function Pos({
       return alert('Choose a customer for credit')
     }
 
-    // A non-credit sale marked Partial/Not Paid still needs a customer to
-    // record the unpaid balance against — otherwise the "added to khata"
-    // amount would have nowhere to attach and would silently be lost.
+    // "Paid in Full" and "Partial / Not Paid" are the Current Bill's
+    // quick-action buttons (deliveryOutcome 'PAID' / 'NOT_PAID'). Either way,
+    // the resulting sale needs a customer attached — for Not Paid/Partial so
+    // the due amount has a khata to land in, and for Paid in Full so every
+    // completed sale is still tied to a customer record. Credit sales
+    // already resolve a customer via the dropdown above, so only gate the
+    // other methods here. If the bill doesn't have customer details yet,
+    // pause and show the customer-details modal instead of blocking with an
+    // alert — checkout() re-runs automatically with the same deliveryOutcome
+    // once details are saved (or picks up existing details unchanged if
+    // they were already entered).
     if (
-      deliveryOutcome === 'NOT_PAID' &&
+      deliveryOutcome &&
       method !== 'CREDIT' &&
-      (!normalizedCustomerName || !normalizedCustomerPhone)
+      (!normalizedCustomerName.trim() || !normalizedCustomerPhone.trim())
     ) {
-      return alert(
-        "Check 'Add to this bill' and enter the customer's name and phone to record a partial/unpaid balance",
-      )
+      setCaptureCustomerDetails(true)
+      setPendingDeliveryOutcome(deliveryOutcome)
+      setCustomerModalError('')
+      setShowCustomerRequiredModal(true)
+      return
     }
 
     const time = now()
@@ -4216,13 +4238,16 @@ function Pos({
     const tid = id()
 
     // Resolve the customer to attach the sale/khata entry to. Credit sales
-    // already have one via the dropdown; for a Partial/Not Paid sale on a
-    // non-credit sale, reuse a matching existing customer (by name + phone)
-    // or create a new one on the fly so the due amount can be tracked.
+    // already have one via the dropdown; for a Paid in Full or Partial/Not
+    // Paid sale on a non-credit sale, reuse a matching existing customer (by
+    // name + phone) or create a new one on the fly, so it never ends up
+    // duplicated and the due amount (if any) can be tracked. The gate above
+    // guarantees normalizedCustomerName/Phone are filled whenever
+    // deliveryOutcome is set on a non-credit sale.
     let saleCustomerId: string | undefined =
       method === 'CREDIT' ? customerId : undefined
 
-    if (deliveryOutcome === 'NOT_PAID' && !saleCustomerId) {
+    if (deliveryOutcome && !saleCustomerId) {
       const normalizedName = normalizedCustomerName.trim().toLowerCase()
       const normalizedPhone = normalizedCustomerPhone.replace(/\D/g, '')
 
@@ -4407,6 +4432,9 @@ function Pos({
     setDiscountInput('')
     setShowUpi(false)
     setUpiPaymentReceived(false)
+    setShowCustomerRequiredModal(false)
+    setPendingDeliveryOutcome(null)
+    setCustomerModalError('')
 
     await refresh()
 
@@ -4665,6 +4693,39 @@ function Pos({
     openPaymentDialog(sale, 'NOT_PAID', false)
   }
 
+  // Cancelling the customer-details modal drops the pending action entirely
+  // — Paid in Full / Partial / Not Paid is not completed, and nothing about
+  // the bill (cart, discount, entered amounts) is touched.
+  const cancelCustomerDetailsModal = () => {
+    setShowCustomerRequiredModal(false)
+    setPendingDeliveryOutcome(null)
+    setCustomerModalError('')
+  }
+
+  // Validates the name + phone entered in the customer-details modal, then
+  // re-runs checkout() with whichever quick action (Paid in Full / Partial /
+  // Not Paid) triggered it. checkout() itself takes care of matching an
+  // existing customer by name + phone or creating a new one, so a customer
+  // is never duplicated here.
+  const confirmCustomerDetailsAndContinue = () => {
+    if (!customerName.trim() || !customerPhone.trim()) {
+      setCustomerModalError(
+        "Enter the customer's name and phone number to continue.",
+      )
+      return
+    }
+
+    setCustomerModalError('')
+    setShowCustomerRequiredModal(false)
+
+    const outcome = pendingDeliveryOutcome
+    setPendingDeliveryOutcome(null)
+
+    if (outcome) {
+      void checkout(outcome)
+    }
+  }
+
   return (
     <div className="space-y-5">
 
@@ -4795,6 +4856,75 @@ function Pos({
                 onClick={handlePaymentConfirm}
               >
                 Mark as Delivered
+              </PrimaryButton>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {/* CUSTOMER DETAILS REQUIRED MODAL */}
+      {showCustomerRequiredModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+          <Card className="w-full max-w-md">
+            <div>
+              <h3 className="text-lg font-bold">
+                Customer details required
+              </h3>
+
+              <p className="mt-2 text-sm text-slate-500">
+                {pendingDeliveryOutcome === 'PAID'
+                  ? "Add the customer's name and phone number to mark this bill as paid in full."
+                  : "Add the customer's name and phone number to record this bill as partial or unpaid."}
+              </p>
+            </div>
+
+            <div className="my-5 space-y-3">
+              <div>
+                <label className="block text-sm font-semibold text-slate-700">
+                  Customer name
+                </label>
+
+                <Input
+                  className="mt-2"
+                  value={customerName}
+                  onChange={(e) => setCustomerName(e.target.value)}
+                  placeholder="Customer name"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700">
+                  Phone number
+                </label>
+
+                <Input
+                  className="mt-2"
+                  value={customerPhone}
+                  onChange={(e) => setCustomerPhone(e.target.value)}
+                  placeholder="Phone number"
+                />
+              </div>
+
+              {customerModalError && (
+                <p className="text-sm font-semibold text-red-600">
+                  {customerModalError}
+                </p>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={cancelCustomerDetailsModal}
+                className="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+
+              <PrimaryButton
+                className="flex-1"
+                onClick={confirmCustomerDetailsAndContinue}
+              >
+                Save &amp; continue
               </PrimaryButton>
             </div>
           </Card>
